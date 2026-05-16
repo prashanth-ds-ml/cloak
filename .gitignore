@@ -1,0 +1,40 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+
+# Data — PDFs, images, outputs are local only, never committed
+data/raw/
+data/images/
+data/markdown/
+!data/.gitkeep
+
+# Logs
+logs/*.log
+!logs/.gitkeep
+
+# CLI config (stores user's project path and settings)
+.cloak.json
+
+# Claude Code local settings (permissions, session state — machine-specific)
+.claude/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Test outputs
+.pytest_cache/

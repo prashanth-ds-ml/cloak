@@ -9,6 +9,8 @@ Phase boundaries are called explicitly by parser_agent via:
   before_vision_phase()       — unloads qwen3:8b when llama3.2-vision is sticky
   before_orchestrator_phase() — unloads llama3.2-vision when it was sticky
 
+GPU/CPU routing: Ollama auto-selects GPU when VRAM is sufficient and splits
+layers to CPU+RAM when it isn't. num_gpu=-1 (the default) enables this.
 qwen2.5vl:7b + qwen3:8b can coexist on 24 GB RAM (~10 GB total, GPU+RAM spill).
 llama3.2-vision:11b (11 GB) cannot coexist with qwen3:8b — enforced by D7.
 """
@@ -125,3 +127,16 @@ def teardown_pdf() -> None:
     if _sticky_vision and _sticky_vision != ORCHESTRATOR_MODEL:
         unload(_sticky_vision)
     reset()
+
+
+def get_ollama_options(base: dict | None = None) -> dict:
+    """
+    Return Ollama options dict for model calls.
+    num_gpu=-1 tells Ollama to use all available GPU layers automatically,
+    falling back to a CPU+GPU split when VRAM is insufficient.
+    Merges any caller-supplied base options.
+    """
+    opts = {"num_gpu": -1}
+    if base:
+        opts.update(base)
+    return opts

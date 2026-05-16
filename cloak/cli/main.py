@@ -21,6 +21,7 @@ console = Console()
 def startup(ctx: typer.Context) -> None:
     """Show hardware + model status (default when no subcommand is given)."""
     from cloak.cli import system_check
+    system_check.run_startup_cleanup()
     system_check.show_startup_screen()
     if ctx.invoked_subcommand is None:
         console.print(
@@ -36,10 +37,7 @@ def parse(
     path: Path = typer.Argument(..., help="PDF file or directory of PDFs to parse"),
 ) -> None:
     """Parse a PDF file or all PDFs in a directory."""
-    from cloak.cli import system_check
     from cloak.orchestration.parser_agent import parse as do_parse
-
-    system_check.show_startup_screen()
 
     if not path.exists():
         console.print(f"[red]Path not found: {path}[/red]")
@@ -78,8 +76,7 @@ def parse(
 @app.command()
 def status() -> None:
     """Show hardware + model status."""
-    from cloak.cli import system_check
-    system_check.show_startup_screen()
+    pass  # startup callback already shows the screen
 
 
 @app.command("list")

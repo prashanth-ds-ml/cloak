@@ -10,7 +10,7 @@ IMG_DIR      = DATA_DIR / "images"
 # ── Ollama models ──────────────────────────────────────────────────────────
 ORCHESTRATOR_MODEL  = "qwen3:8b"          # tool-calling, planning
 VISION_PRIMARY      = "qwen2.5vl:7b"      # OCR, layout, quality judge
-VISION_FALLBACK     = "llama3.2-vision:11b"
+VISION_FALLBACK     = "qwen3-vl:4b"           # 3.3 GB — lighter fallback, same VL family
 
 OLLAMA_BASE_URL     = "http://localhost:11434"
 
@@ -30,6 +30,7 @@ MAX_AGENT_ITERS     = 10       # ReAct loop cap
 MIN_IMAGE_BYTES     = 5_000    # ignore images smaller than this
 
 MODEL_NUM_CTX       = 4096     # Ollama context window — lower saves VRAM
+FORMAT_NUM_CTX      = 8192     # larger context for Phase 4 FORMAT — avoids qwen3 thinking tokens truncating output
 MAX_IMAGE_PX        = 1024     # long-edge cap before sending image to VLM
 MODEL_KEEP_ALIVE    = 0        # keep_alive=0 — explicit phase-based unloads handle lifecycle (D11)
 
@@ -39,6 +40,11 @@ MIN_FREE_RAM_GB         = 9.0   # minimum free RAM to enable vision model (D18)
 # ── Page profiler thresholds ────────────────────────────────────────────────
 SCANNED_TEXT_THRESHOLD  = 100   # chars below which a page is considered scanned (D21)
 IMAGE_AREA_THRESHOLD    = 0.4   # image area ratio above which a page is image_heavy (D21)
+
+# ── Deep review (Phase 9) ───────────────────────────────────────────────────
+# Runs after pipeline models are unloaded. Larger model, Ollama handles CPU+GPU split.
+DEEP_REVIEW_MODEL   = "gemma4:latest"  # 9.6 GB — uses CPU+GPU split after teardown
+DEEP_REVIEW_TIMEOUT = 600              # 10 min — CPU+GPU split is slower
 
 # ── OCR ─────────────────────────────────────────────────────────────────────
 OCR_LANG                = "eng" # Tesseract language code (D22)

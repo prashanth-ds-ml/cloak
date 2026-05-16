@@ -8,6 +8,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+# Reconfigure stdout for UTF-8 on Windows (in-place — does not replace the object)
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 app = typer.Typer(
     name="cloak",
     help="Content-aware Local Ollama Agentic Knowledge Parser",
@@ -20,21 +24,17 @@ console = Console()
 @app.callback(invoke_without_command=True)
 def startup(ctx: typer.Context) -> None:
     """Show hardware + model status (default when no subcommand is given)."""
-    from cloak.cli import system_check
-    system_check.run_startup_cleanup()
-    system_check.show_startup_screen()
     if ctx.invoked_subcommand is None:
-        console.print(
-            "Commands: [bold]parse[/bold] <pdf|dir>  "
-            "[bold]status[/bold]  "
-            "[bold]list[/bold]\n"
-        )
+        from cloak.cli import system_check
+        system_check.run_startup_cleanup()
+        system_check.show_startup_screen(show_commands=True)
         raise typer.Exit()
 
 
 @app.command()
 def parse(
     path: Path = typer.Argument(..., help="PDF file or directory of PDFs to parse"),
+    no_review: bool = typer.Option(False, "--no-review", help="Skip Phase 9 deep quality review"),
 ) -> None:
     """Parse a PDF file or all PDFs in a directory."""
     from cloak.orchestration.parser_agent import parse as do_parse
@@ -61,7 +61,7 @@ def parse(
         if len(pdfs) > 1:
             console.rule(f"[dim]{i}/{len(pdfs)}: {pdf.name}[/dim]")
         try:
-            do_parse(pdf)
+            do_parse(pdf, deep_review=not no_review)
         except Exception as exc:
             console.print(f"[red]Failed: {pdf.name} — {exc}[/red]")
             errors.append((pdf, str(exc)))
@@ -76,7 +76,9 @@ def parse(
 @app.command()
 def status() -> None:
     """Show hardware + model status."""
-    pass  # startup callback already shows the screen
+    from cloak.cli import system_check
+    system_check.run_startup_cleanup()
+    system_check.show_startup_screen()
 
 
 @app.command("list")

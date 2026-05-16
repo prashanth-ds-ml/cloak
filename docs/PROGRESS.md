@@ -1,6 +1,6 @@
 ---
 type: session-log
-updated: 2026-05-16
+updated: 2026-05-16 (Session 8)
 ---
 
 # Progress — cloak
@@ -9,34 +9,39 @@ updated: 2026-05-16
 
 ---
 
-## Current state — end of 2026-05-16 (Session 7)
+## Current state — end of 2026-05-16 (Session 8)
 
-**8-phase pipeline fully implemented. All 10 modules done. CLI working.**
+**9-phase pipeline. 11 modules. CLI working. Deep review integrated.**
 
-The profiler-routed pipeline is in production. Run `cloak parse <pdf>` to parse any PDF. Install Tesseract for OCR support on scanned pages.
+All prior 8 phases are in production. Session 8 added Phase 9 (post-pipeline deep quality review), replaced the vision fallback model, fixed heading extraction, and fixed CLI startup behavior.
 
 ### What is working
-- **Full 8-phase pipeline**: profiler → selective extraction → FORMAT → judge+patch loop → confidence output
+- **Full 9-phase pipeline**: profiler → vision extraction (headings from layout) → FORMAT → judge+patch loop → confidence output → deep quality review
 - **Page profiler**: heuristic classification into `text_rich | table_heavy | image_heavy | scanned | mixed`
-- **Selective vision (D23)**: vision only called for `image_heavy`/`mixed` pages in Phase 3
+- **Vision for all page types (D23 updated)**: ALL pages use `full_page_extract()` when vision is available — headings come from visual layout, not pdfplumber flat text
+- **Region image persistence**: ECG/figure/diagram crops saved to `{stem}_images/`, embedded as `![label](path)` in markdown
 - **OCR tools**: Tesseract wrapper with graceful fallback — raises `OCRError` if binary missing
-- **FORMAT step (D20)**: qwen3:8b restructures raw content once before judge loop
+- **FORMAT step (D20)**: qwen3:8b restructures raw content once before judge loop; uses `/no_think` prefix to suppress thinking chain
 - **Extract-once (D19)**: Phases 5–6 judge+patch only, no re-extraction
+- **Phase 9 deep review (D27)**: gemma4:latest (9.6 GB, CPU+GPU split) compares pdfplumber text vs final markdown, writes `{stem}_review.md`
 - **Confidence report (D24)**: `{stem}_confidence.md` with per-page High/Medium/Low
 - **typer CLI**: `cloak parse`, `cloak status`, `cloak list` all functional
-- **Startup screen**: hardware table + model status table + Ollama check
+- **Startup screen**: shown only on bare `cloak` and `cloak status` (D17 updated)
+- **VRAM-aware suitability check**: all three pipeline models show `ready (GPU)` on RTX 5050
 
-### Hardware bottleneck status
-| Model | Status | Note |
+### Hardware bottleneck status (Session 8)
+| Model | VRAM | Status |
 |---|---|---|
-| `qwen2.5vl:7b` | Marginal — needs 9 GB free RAM | Close Chrome/heavy apps before parsing |
-| `llama3.2-vision:11b` | Excluded from full-page OCR (times out) | Used only for region crops via patch loop |
-| `qwen3:8b` | Works fine | — |
+| `qwen2.5vl:7b` | 7.3 GB | Ready (GPU) — vision primary |
+| `qwen3:8b` | 5.2 GB | Ready (GPU) — orchestrator |
+| `qwen3-vl:4b` | 3.5 GB | Ready (GPU) — vision fallback (replaced llama3.2-vision) |
+| `gemma4:latest` | 9.6 GB | Phase 9 only — CPU+GPU split after teardown |
 
 ### Run commands
 ```powershell
 .\.venv\Scripts\Activate.ps1
-cloak parse data/raw/cardiology/stemi.pdf     # single file
+cloak parse data/raw/cardiology/stemi.pdf          # single file (with Phase 9 deep review)
+cloak parse data/raw/cardiology/stemi.pdf --no-review  # skip Phase 9
 cloak parse data/raw/cardiology/              # whole directory
 cloak status                                   # hardware + model status
 cloak list                                     # show parsed docs
@@ -54,15 +59,16 @@ winget install UB-Mannheim.TesseractOCR
 | # | Module | Path | Status |
 |---|---|---|---|
 | 1 | PDF extractor | `extraction/pdf_tools.py` | **done + tested** |
-| 2 | Vision model calls | `vision/vision_tools.py` | **done** — domain-neutral prompts (D16) |
+| 2 | Vision model calls | `vision/vision_tools.py` | **done** — `full_page_extract`, `region_describe`, `judge_quality`; `layout_hints` removed (D23) |
 | 3 | Quality judge | `quality/quality_judge.py` | **done** — PageScore with per-page confidence (D24) |
-| 4 | Model router | `orchestration/model_router.py` | **done + wired** — phase-based (D14) |
+| 4 | Model router | `orchestration/model_router.py` | **done + wired** — phase-based (D14); fallback is now qwen3-vl:4b |
 | 5 | Context compressor | `orchestration/context_manager.py` | **done** |
-| 6 | Orchestrator | `orchestration/parser_agent.py` | **done** — 8-phase pipeline (D19/D20/D21/D23) |
+| 6 | Orchestrator | `orchestration/parser_agent.py` | **done** — 9-phase pipeline; vision for all page types (D23); region image persistence; Phase 9 integration |
 | 7 | Page profiler | `profiling/page_profiler.py` | **done** — 5-type heuristic classification (D21) |
 | 8 | OCR tools | `extraction/ocr_tools.py` | **done** — Tesseract wrapper, graceful fallback (D22) |
-| 9 | Hardware check | `cli/system_check.py` | **done** — startup screen, RAM gate (D17/D18) |
-| 10 | CLI | `cli/main.py` | **done** — typer: parse/status/list (D17) |
+| 9 | Hardware check | `cli/system_check.py` | **done** — VRAM-aware suitability check; startup cleanup; startup screen only on `cloak`/`cloak status` (D17/D18) |
+| 10 | CLI | `cli/main.py` | **done** — `parse/status/list`; `--no-review` flag; startup screen not shown on `parse` (D17) |
+| 11 | Deep review | `quality/deep_review.py` | **done** — Phase 9; gemma4:latest; CPU+GPU split; `{stem}_review.md` (D27) |
 | — | Legacy reference | `ingestion/pdf_extractor.py` | read-only |
 | — | Legacy reference | `ingestion/pdf_classifier.py` | read-only |
 | — | Legacy reference | `ingestion/vision.py` | read-only |
@@ -71,6 +77,32 @@ winget install UB-Mannheim.TesseractOCR
 ---
 
 ## Sessions
+
+### 2026-05-16 — Session 8: Phase 9, fallback swap, heading fix, CLI cleanup
+
+**Done**
+
+- **Phase 9 Deep Review (D27)**: built `quality/deep_review.py` — loads `gemma4:latest` after `teardown_pdf()`, compares raw pdfplumber text vs final markdown, writes `{stem}_review.md` with structured report (Missing Content, Headings, Tables, Duplicates, Formatting, Quality Score, Priority Fixes)
+- **VISION_FALLBACK swap (D15)**: replaced `llama3.2-vision:11b` (7.8 GB, CPU spill, timeout) with `qwen3-vl:4b` (3.3 GB, GPU-only, same VL family). All three pipeline models now show `ready (GPU)` at startup
+- **Heading fix (D23 updated)**: `text_rich` pages now use `full_page_extract()` directly — vision reads visual layout and assigns headings in one pass. Removed `layout_hints()` function and `_build_layout_context()` from codebase entirely
+- **Region image persistence**: `_images_dir()` and `_save_region()` save ECG/figure/diagram crops to `{stem}_images/`; images embedded in markdown as `![label](path)` for RAG; saved count shown in final Panel
+- **CLI startup fix (D17)**: startup screen (`show_startup_screen`) now only called on bare `cloak` and `cloak status`. Not shown on `cloak parse` or `cloak list` — avoids hardware table cluttering parse output
+- **CLI `--no-review` flag**: `cloak parse --no-review` skips Phase 9. Default is to run deep review
+- **FORMAT prompt upgrade**: added `/no_think` prefix (qwen3-specific — suppresses thinking chain), updated to 6 explicit rules; `FORMAT_NUM_CTX = 8192` in config to prevent thinking tokens truncating output
+- **VRAM-aware suitability check**: `check_model_suitability()` now takes `free_vram_gb` param; priority: GPU → CPU+GPU split → CPU → marginal → unavailable. All three models show `ready (GPU)` on RTX 5050
+- **Startup memory cleanup**: `run_startup_cleanup()` unloads idle Ollama models at startup, reports freed RAM/VRAM; shows top memory consumers when headroom is tight
+- **`sys.stdout.reconfigure()` fix**: removed `io.TextIOWrapper` stdout replacement (caused closed-file bugs on Windows); replaced with in-place `reconfigure(encoding="utf-8")`
+- **`config.py` additions**: `DEEP_REVIEW_MODEL`, `DEEP_REVIEW_TIMEOUT`, `FORMAT_NUM_CTX`; removed `LAYOUT_HINTS_TIMEOUT`
+
+**Known issues / follow-up**
+- `gemma4:latest` not-installed case gives raw exception — should show friendly message
+- `/no_think` prefix in FORMAT prompt is qwen3-specific — should be conditional on model name
+- `qwen3-vl:4b` not yet tested as `VISION_PRIMARY` — worth benchmarking on 1–2 PDFs
+- Content-loss guard (35%) may trigger on legitimate FORMAT cleanup now that input includes vision-extracted content + image refs; consider raising `CONTENT_LOSS_LIMIT` to 0.50
+- Region image paths in markdown are relative — only work correctly when markdown is opened from `data/markdown/{specialty}/` directory
+- Docs not yet tested against actual PDF parse run (end-to-end integration test pending)
+
+---
 
 ### 2026-05-16 — Session 7: Full 8-phase implementation
 
@@ -209,10 +241,11 @@ winget install UB-Mannheim.TesseractOCR
 | Best round wins | Return highest-scoring round, not last — [[DECISIONS.md]] §D2 |
 | Quality threshold | Stop at 8.0/10 — [[DECISIONS.md]] §D3 |
 | Content-loss guard | Revert if >35% chars removed — [[DECISIONS.md]] §D5 |
-| VRAM rule | Never load `llama3.2-vision` + `qwen3:8b` together — [[DECISIONS.md]] §D7 |
 | Context cap | Compress history above 8K tokens — [[DECISIONS.md]] §D6 |
 | Spatial sort | Column order (bbox), not PDF draw order — [[DECISIONS.md]] §D4 |
 | Extract once | Vision extraction runs only in round 1 — [[DECISIONS.md]] §D19 |
 | FORMAT before PATCH | Round 1 formats first, then patches gaps — [[DECISIONS.md]] §D20 |
 | General-purpose | No domain-specific assumptions in prompts — [[DECISIONS.md]] §D16 |
+| Vision for headings | text_rich pages use full_page_extract for layout — [[DECISIONS.md]] §D23 |
+| One model at a time | teardown_pdf() before Phase 9 loads gemma4 — [[DECISIONS.md]] §D27 |
 | Legacy files | Read-only — do not modify `pdf_extractor`, `pdf_classifier`, `vision`, `markdown_builder` |

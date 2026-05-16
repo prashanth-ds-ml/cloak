@@ -156,7 +156,6 @@ _REGION_PROMPTS = {
     "figure":  _FIGURE_PROMPT,
 }
 
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def full_page_extract(
@@ -189,6 +188,7 @@ def region_describe(
         "images":  [img_bytes],
     }]
     return _call_timed(model, messages, timeout)
+
 
 
 def judge_quality(

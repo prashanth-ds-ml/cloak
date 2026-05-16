@@ -7,7 +7,6 @@ sentinel values (0.0, "unknown", empty list) and display a warning instead.
 """
 from __future__ import annotations
 
-import io
 import subprocess
 import sys
 import time
@@ -18,9 +17,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-# Force UTF-8 stdout on Windows so unicode symbols don't crash in cp1252 terminals
-if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Reconfigure stdout in-place — does NOT replace the object (avoids closed-file bugs)
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from cloak.config import (
     MIN_FREE_RAM_GB,
@@ -36,7 +35,7 @@ console = Console(legacy_windows=False)
 _MODEL_RAM_GB: dict[str, float] = {
     VISION_PRIMARY:     9.0,   # qwen2.5vl:7b
     ORCHESTRATOR_MODEL: 5.5,   # qwen3:8b
-    VISION_FALLBACK:    11.0,  # llama3.2-vision:11b
+    VISION_FALLBACK:    4.5,   # qwen3-vl:4b
 }
 
 # Approximate VRAM required at Q4_K_M quantization (±0.5 GB)
@@ -44,7 +43,7 @@ _MODEL_RAM_GB: dict[str, float] = {
 _MODEL_VRAM_GB: dict[str, float] = {
     VISION_PRIMARY:     7.3,   # qwen2.5vl:7b — vision encoder makes it ~7.3 GB
     ORCHESTRATOR_MODEL: 5.2,   # qwen3:8b
-    VISION_FALLBACK:    8.0,   # llama3.2-vision:11b
+    VISION_FALLBACK:    3.5,   # qwen3-vl:4b
 }
 
 _MODEL_ROLE: dict[str, str] = {
@@ -221,31 +220,32 @@ def check_model_suitability(model: str, free_ram_gb: float, free_vram_gb: float 
 
     if free_vram_gb >= vram_needed:
         status, backend = "ready", "GPU"
-        reason = f"fits in VRAM ({free_vram_gb:.1f} GB free)"
+        note = f"{free_vram_gb:.1f} GB VRAM free"
     elif free_vram_gb >= vram_needed * 0.85:
         status, backend = "marginal", "GPU"
-        reason = f"need {vram_needed:.1f} GB VRAM / have {free_vram_gb:.1f} GB — close apps"
+        note = f"need {vram_needed:.1f} GB, have {free_vram_gb:.1f} GB"
     elif free_vram_gb > 0 and (free_vram_gb + free_ram_gb) >= vram_needed:
         status, backend = "ready", "CPU+GPU"
-        reason = f"split: {free_vram_gb:.1f} GB VRAM + {free_ram_gb:.1f} GB RAM"
+        note = f"{free_vram_gb:.1f} GB VRAM + {free_ram_gb:.1f} GB RAM"
     elif free_ram_gb >= ram_needed:
         status, backend = "ready", "CPU"
-        reason = f"CPU only ({free_ram_gb:.1f} GB RAM free)"
+        note = f"{free_ram_gb:.1f} GB RAM free"
     elif free_ram_gb >= ram_needed * 0.85:
         status, backend = "marginal", "CPU"
-        reason = f"need {ram_needed:.1f} GB RAM / have {free_ram_gb:.1f} GB"
+        note = f"need {ram_needed:.1f} GB, have {free_ram_gb:.1f} GB RAM"
     else:
         status, backend = "unavailable", ""
         if free_vram_gb > 0:
-            reason = f"need {vram_needed:.1f} GB VRAM / have {free_vram_gb:.1f} GB"
+            note = f"need {vram_needed:.1f} GB VRAM, have {free_vram_gb:.1f} GB"
         else:
-            reason = f"need {ram_needed:.1f} GB RAM / have {free_ram_gb:.1f} GB"
+            note = f"need {ram_needed:.1f} GB RAM, have {free_ram_gb:.1f} GB"
 
     return {
         "model":             model,
         "status":            status,
         "backend":           backend,
-        "reason":            reason,
+        "note":              note,
+        "reason":            note,   # backward-compat alias
         "required_vram_gb":  vram_needed,
         "required_ram_gb":   ram_needed,
     }
@@ -275,7 +275,7 @@ def ram_gate(min_gb: float = MIN_FREE_RAM_GB) -> bool:
 
 # ── Startup screen ────────────────────────────────────────────────────────────
 
-def show_startup_screen() -> None:
+def show_startup_screen(show_commands: bool = False) -> None:
     """Print the hardware + model status panel. Safe to call multiple times."""
     free_ram   = get_free_ram_gb()
     total_ram  = get_total_ram_gb()
@@ -287,78 +287,89 @@ def show_startup_screen() -> None:
 
     # ── banner ────────────────────────────────────────────────────────────────
     console.print(Panel.fit(
-        "[bold cyan]cloak[/bold cyan]  Content-aware Local Ollama Agentic Knowledge Parser\n"
+        "[bold cyan]cloak[/bold cyan]  [dim]PDF → Markdown[/dim]\n"
         "[dim]Local-only · No data leaves your machine[/dim]",
         border_style="cyan",
     ))
 
     # ── hardware ──────────────────────────────────────────────────────────────
     hw = Table.grid(padding=(0, 2))
-    hw.add_column(style="dim")
+    hw.add_column(style="bold dim", min_width=8)
     hw.add_column()
 
-    gpu_line = f"{gpu_name}"
+    gpu_line = gpu_name
     if total_vram > 0:
-        gpu_line += f"  {total_vram:.0f} GB VRAM"
+        gpu_line += f"  [dim]{total_vram:.0f} GB VRAM[/dim]"
     if free_vram > 0:
-        gpu_line += f"  ({free_vram:.1f} GB free)"
+        gpu_line += f"  [green]{free_vram:.1f} GB free[/green]"
 
     hw.add_row("GPU", gpu_line)
-    hw.add_row("RAM", f"{total_ram:.0f} GB total  /  {free_ram:.1f} GB free")
+    hw.add_row("RAM", f"{total_ram:.0f} GB total  [dim]/[/dim]  [green]{free_ram:.1f} GB free[/green]")
 
-    ollama_status = "[green]running[/green]" if ollama_ok else "[red]not running[/red]"
-    hw.add_row("Ollama", f"{OLLAMA_BASE_URL}  {ollama_status}")
+    ollama_dot = "[green]●[/green]" if ollama_ok else "[red]●[/red]"
+    ollama_txt = "running" if ollama_ok else "[red]not running — start with: ollama serve[/red]"
+    hw.add_row("Ollama", f"{ollama_dot}  {OLLAMA_BASE_URL}  {ollama_txt}")
 
     console.print(hw)
     console.print()
 
     # ── models ────────────────────────────────────────────────────────────────
-    models_tbl = Table(show_header=True, header_style="bold dim", box=None, pad_edge=False)
-    models_tbl.add_column("", width=2)
-    models_tbl.add_column("Model", style="cyan", min_width=24)
-    models_tbl.add_column("Role", style="dim", min_width=16)
-    models_tbl.add_column("Status", min_width=18)
-    models_tbl.add_column("Notes", style="dim")
+    models_tbl = Table(show_header=True, header_style="dim", box=None, pad_edge=False,
+                       show_edge=False)
+    models_tbl.add_column("",      width=3,        no_wrap=True)
+    models_tbl.add_column("Model", style="cyan",   min_width=22, no_wrap=True)
+    models_tbl.add_column("Role",  style="dim",    min_width=17, no_wrap=True)
+    models_tbl.add_column("Status · Note")
 
     for model in (VISION_PRIMARY, ORCHESTRATOR_MODEL, VISION_FALLBACK):
         result    = check_model_suitability(model, free_ram, free_vram)
         is_pulled = any(model in m for m in installed)
         status    = result["status"]
         backend   = result["backend"]
+        note      = result["note"]
 
         if not ollama_ok:
-            icon, status_str = "[red]✗[/red]", "[red]Ollama offline[/red]"
+            icon       = "[red]✗[/red]"
+            status_str = "[red]Ollama offline[/red]"
         elif not is_pulled:
-            icon, status_str = "[yellow]![/yellow]", "[yellow]not pulled[/yellow]"
+            icon       = "[yellow]![/yellow]"
+            status_str = f"[yellow]not pulled[/yellow]  [dim]ollama pull {model}[/dim]"
         elif status == "ready":
-            label = f"ready ({backend})" if backend else "ready"
-            color = "green" if backend in ("GPU", "CPU+GPU") else "yellow"
-            icon, status_str = f"[{color}]✓[/{color}]", f"[{color}]{label}[/{color}]"
+            color      = "green" if backend in ("GPU", "CPU+GPU") else "yellow"
+            label      = f"ready ({backend})" if backend else "ready"
+            icon       = f"[{color}]✓[/{color}]"
+            status_str = f"[{color}]{label}[/{color}]  [dim]{note}[/dim]"
         elif status == "marginal":
-            label = f"marginal ({backend})" if backend else "marginal"
-            icon, status_str = "[yellow]~[/yellow]", f"[yellow]{label}[/yellow]"
+            label      = f"marginal ({backend})" if backend else "marginal"
+            icon       = "[yellow]~[/yellow]"
+            status_str = f"[yellow]{label}[/yellow]  [dim]{note}[/dim]"
         else:
-            icon, status_str = "[red]✗[/red]", "[red]unavailable[/red]"
+            icon       = "[red]✗[/red]"
+            status_str = f"[red]unavailable[/red]  [dim]{note}[/dim]"
 
-        models_tbl.add_row(
-            icon, model, _MODEL_ROLE.get(model, ""), status_str, result["reason"]
-        )
+        models_tbl.add_row(icon, model, _MODEL_ROLE.get(model, ""), status_str)
 
     console.print(models_tbl)
+    console.print()
 
     # ── warnings ──────────────────────────────────────────────────────────────
-    if not ollama_ok:
-        console.print(
-            "\n[red]Ollama is not running.[/red] Start it with: [bold]ollama serve[/bold]"
-        )
-    else:
+    if ollama_ok:
         vision_result = check_model_suitability(VISION_PRIMARY, free_ram, free_vram)
         if vision_result["status"] == "unavailable":
             console.print(
-                f"\n[yellow]Vision unavailable — "
-                f"need {vision_result['required_vram_gb']:.0f} GB VRAM "
-                f"or {vision_result['required_ram_gb']:.0f} GB RAM. "
-                f"Parse will use text-only extraction.[/yellow]"
+                f"[yellow]Vision unavailable — need {vision_result['required_vram_gb']:.0f} GB "
+                f"VRAM or {vision_result['required_ram_gb']:.0f} GB RAM. "
+                f"Parse will use text-only extraction.[/yellow]\n"
             )
 
-    console.print()
+    # ── commands help (shown only on bare `cloak`) ────────────────────────────
+    if show_commands:
+        cmds = Table.grid(padding=(0, 2))
+        cmds.add_column(style="bold cyan", no_wrap=True)
+        cmds.add_column(style="dim")
+        cmds.add_row("cloak parse <pdf>", "parse a single PDF")
+        cmds.add_row("cloak parse <dir>", "parse all PDFs in a directory")
+        cmds.add_row("cloak list",        "list all parsed documents")
+        cmds.add_row("cloak status",      "hardware & model status")
+        console.print(cmds)
+        console.print()

@@ -1,6 +1,6 @@
 ---
 type: decision-log
-updated: 2026-05-16
+updated: 2026-05-16 (Session 8)
 ---
 
 # Decision Log — cloak
@@ -81,13 +81,15 @@ Why things are the way they are. Read before changing any design parameter.
 
 ## D7 — VRAM rule: llama3.2-vision never coexists with qwen3:8b
 
-**Decision:** Before loading `llama3.2-vision:11b`, unload `qwen3:8b`. After the fallback round, unload it and let `qwen3:8b` reload on demand.
+**Decision (original):** Before loading `llama3.2-vision:11b`, unload `qwen3:8b`.
 
-**Why:** Together they exceed 8GB VRAM. While Ollama can spill to RAM, doing so for both large models simultaneously causes inference to slow to unusable speeds on this hardware (confirmed in live testing — both timeout).
+**Status (Session 8): superseded.** `llama3.2-vision:11b` has been replaced by `qwen3-vl:4b` (3.3 GB, GPU-only) as `VISION_FALLBACK`. `qwen3-vl:4b` coexists freely with `qwen3:8b` — the coexistence constraint no longer applies to the fallback model.
 
-**Confirmed in testing (2026-05-15):** When `llama3.2-vision:11b` loads at 11GB (42% CPU / 58% GPU), `qwen3:8b` cannot load alongside it. Both vision inference AND orchestrator calls time out.
+**Original rationale (preserved for history):** Together they exceeded 8 GB VRAM. Ollama CPU+GPU split caused both models to time out simultaneously. Confirmed in testing 2026-05-15.
 
-**See:** [[MODELS.md]] §VRAM rules · [[MODULES.md]] §model_router
+**D7 is now a historical record, not an active constraint.** The new VRAM rule is: both `qwen2.5vl:7b` and `qwen3-vl:4b` coexist with `qwen3:8b` safely (both fit in 8 GB VRAM).
+
+**See:** D15 · [[MODELS.md]] §VRAM rules · [[MODULES.md]] §model_router
 
 ---
 
@@ -150,28 +152,34 @@ Why things are the way they are. Read before changing any design parameter.
 ## D14 — Phase-based sequential model routing
 
 **Decision:** Each quality round is split into two explicit phases with hard model boundaries:
-- **VISION PHASE** (extract + judge): `before_vision_phase()` called at start — unloads `qwen3:8b` if `llama3.2-vision` is sticky.
-- **ORCHESTRATOR PHASE** (patch): `before_orchestrator_phase()` called before patch loop — unloads `llama3.2-vision` if sticky, resets sticky→None so region calls use `qwen2.5vl:7b`.
+- **VISION PHASE** (extract + judge): `before_vision_phase()` called at start.
+- **ORCHESTRATOR PHASE** (patch): `before_orchestrator_phase()` called before patch loop.
 
-**Why:** The previous approach switched models reactively per-page inside `_extract_all_pages()`. This caused `qwen3:8b` to be unloaded mid-round (before the patch phase needed it), forcing a cold reload every round that hit a fallback. Predictable phase boundaries eliminate that hidden latency and make VRAM state auditable at every point in the loop.
+**Why:** The previous approach switched models reactively per-page. Predictable phase boundaries eliminate hidden latency and make VRAM state auditable at every point in the loop.
 
-**Trade-off:** When `qwen2.5vl:7b` is sticky, `before_vision_phase()` is a no-op (the two models coexist). When `llama3.2-vision` is sticky, the extra unload/reload adds ~2–3s per phase boundary — worth it for correctness.
+**Session 8 update:** With `qwen3-vl:4b` as `VISION_FALLBACK` (3.3 GB), both vision models coexist freely with `qwen3:8b`. `before_vision_phase()` and `before_orchestrator_phase()` are now no-ops for both fallback scenarios — they exist to enforce the rule structurally, not because any model pair actually conflicts.
 
 **See:** [[ARCHITECTURE.md]] §Phase-based model routing · [[MODELS.md]] §VRAM rules · [[MODULES.md]] §model_router
 
 ---
 
-## D15 — llama3.2-vision:11b excluded from full-page OCR
+## D15 — llama3.2-vision:11b replaced by qwen3-vl:4b as VISION_FALLBACK
 
-**Decision:** `_extract_all_pages()` no longer attempts `llama3.2-vision:11b` as a per-page fallback. If the sticky model fails a page, the page falls directly to raw text.
+**Original decision (Session 4–7):** `llama3.2-vision:11b` excluded from full-page OCR — times out at 400s. Used only for region crops.
 
-**Why:** On this hardware `llama3.2-vision:11b` spills ~42% of its weights to CPU RAM. Full-page OCR (1024px image → large KV cache) consistently times out at 180s. Attempting it mid-extract wastes the timeout, unloads `qwen3:8b` prematurely (via the old `switch_to_fallback()`), and still produces no output. Raw text is strictly better than a 3-minute timeout with no result.
+**Session 8 decision:** `VISION_FALLBACK` changed from `llama3.2-vision:11b` to `qwen3-vl:4b`.
 
-**llama3.2-vision is still used for:** `get_region_description` tool calls during the patch loop — region crops are 3–5× smaller images, inference is faster and more likely to succeed within timeout.
+**Why the swap:**
+- `llama3.2-vision:11b` at 7.8 GB barely fit in 7.6 GB free VRAM and required CPU spill — causing consistent timeouts even for region crops.
+- `qwen3-vl:4b` at 3.3 GB loads fully in GPU VRAM. Shows `ready (GPU)` in startup screen. Same VL model family as primary — consistent output format.
+- All three pipeline models (`qwen2.5vl:7b`, `qwen3:8b`, `qwen3-vl:4b`) now fit in 8 GB VRAM. No CPU spill.
 
-**Current status (Session 7):** VISION_TIMEOUT has been raised to 400s (D18). However, llama3.2-vision:11b still times out for full-page OCR at 400s on this hardware. It remains excluded. If free RAM reaches ≥14 GB and inference speed improves, it could be re-enabled for `image_heavy` pages in `_extract_vision_page()`.
+**What changed in code:**
+- `config.py`: `VISION_FALLBACK = "qwen3-vl:4b"`
+- `system_check.py`: `_MODEL_VRAM_GB[VISION_FALLBACK]` = 3.5 GB; `_MODEL_RAM_GB[VISION_FALLBACK]` = 4.5 GB
+- D7 coexistence constraint no longer applies (see D7).
 
-**See:** [[MODELS.md]] §VRAM observations · [[MODULES.md]] §parser_agent §3-step extract cascade
+**See:** [[MODELS.md]] §VRAM observations · [[MODULES.md]] §model_router
 
 ---
 
@@ -189,14 +197,16 @@ Why things are the way they are. Read before changing any design parameter.
 
 ## D17 — CLI-first: startup shows hardware + model status
 
-**Decision:** `cloak` (no arguments) shows a startup screen with hardware status and model suitability. Every invocation of `cloak parse` also shows this screen before parsing begins.
+**Decision:** `cloak` (no arguments) shows a startup screen with hardware status and model suitability. `cloak status` also shows it explicitly.
 
-**Why:** The user must know whether vision parsing is available before waiting for a parse to complete. If qwen2.5vl:7b cannot load (insufficient RAM), the user should see this immediately and know what to close.
+**Session 8 update:** The startup screen is NOT shown on `cloak parse`, `cloak list`, or `--help`. It was removed from `parse` to avoid overhead on batch parsing and to prevent the hardware table from cluttering parse output.
+
+**Why:** The user needs to know whether vision parsing is available — but only when explicitly asking. During a parse run the hardware table is noise. `cloak status` remains the explicit check.
 
 **CLI commands:**
 ```
-cloak                    → startup screen (hardware + model status)
-cloak parse <pdf|dir>    → parse PDF(s)
+cloak                    → startup screen (hardware + model status) + command list
+cloak parse <pdf|dir>    → parse PDF(s) — no startup screen
 cloak status             → hardware + model status only
 cloak list               → list parsed documents in data/markdown/
 ```
@@ -213,15 +223,21 @@ cloak list               → list parsed documents in data/markdown/
 1. **Startup display**: "what could potentially work on this machine right now" — informational, runs against installed model list
 2. **Runtime probe**: "does the model actually load right now" — authoritative, runs before each parse
 
-The startup display is built from `GET /api/tags` (installed models) + `psutil` (free RAM) + known model RAM requirements. It gives the user actionable info before they commit to a parse.
+The startup display is built from `GET /api/tags` (installed models) + `psutil` (free RAM) + nvidia-smi (VRAM) + known model requirements. It gives the user actionable info before they commit to a parse.
 
-**Model RAM requirements (confirmed on RTX 5050 / 24 GB RAM):**
+**Model requirements (Session 8 — updated for qwen3-vl:4b fallback):**
 
-| Model | VRAM | System RAM | Min free RAM needed |
+| Model | VRAM needed | RAM needed | Role |
 |---|---|---|---|
-| `qwen2.5vl:7b` | ~5 GB GPU | ~3.6 GB RAM | 9.0 GB |
-| `qwen3:8b` | ~5 GB GPU | ~0.5 GB RAM | 5.5 GB |
-| `llama3.2-vision:11b` | ~4.6 GB GPU | ~6.4 GB RAM | 11.0 GB |
+| `qwen2.5vl:7b` | ~7.3 GB | 9.0 GB | Vision primary |
+| `qwen3:8b` | ~5.2 GB | 5.5 GB | Orchestrator |
+| `qwen3-vl:4b` | ~3.5 GB | 4.5 GB | Vision fallback |
+
+**Suitability priority (VRAM-aware):**
+1. GPU — model fits fully in VRAM → `ready (GPU)`
+2. CPU+GPU — VRAM + RAM together cover model → `ready (CPU+GPU)`
+3. CPU — no GPU but RAM sufficient → `ready (CPU)`
+4. Marginal (≥ 85% of needed) or unavailable
 
 **See:** [[MODULES.md]] §system_check · [[MODELS.md]] §Model suitability table
 
@@ -300,17 +316,29 @@ Rounds 2+ patch sessions do NOT re-format — they only fill remaining content g
 
 ---
 
-## D23 — Vision extraction is selective, not universal
+## D23 — Vision extraction strategy for text_rich pages
 
-**Decision:** In Phase 3 (extraction), the vision model (`qwen2.5vl:7b`) is called only for pages classified as `image_heavy` or `mixed`. Pages classified as `text_rich`, `table_heavy`, or `scanned` do not call the vision model during extraction.
+**Original decision (Session 7):** In Phase 3, vision is called only for `image_heavy` or `mixed` pages. `text_rich` pages use pdfplumber flat text + a separate `layout_hints` vision call (heading detection as JSON) which FORMAT then applied.
 
-**Why:** The original pipeline attempted vision extraction on every page. For a 20-page PDF with 18 clean-text pages and 2 diagram pages, that wasted 18 × 400s timeout slots. Selective extraction means vision is used where it genuinely adds value — pages where text extraction fails to capture the content (diagrams, forms, infographics, image-only pages).
+**Session 8 update:** `text_rich` pages now call `full_page_extract()` directly (same as `image_heavy`). The separate `layout_hints` vision call has been removed entirely.
 
-**Phase 5 (Judge) still runs vision on every page** — scoring quality still requires comparing the rendered image against the draft markdown. Only Phase 3 extraction is selective.
+**Why the change:** The `layout_hints` approach was fragile:
+- Vision returns heading JSON → FORMAT reads flat text + applies headings → two-step with mismatch potential
+- FORMAT was often ignoring or misapplying the layout hints because the raw text had no structure to anchor them to
+- Headings were being lost consistently in test runs
 
-**Trade-off:** A `text_rich` page misclassified by the profiler will not get a vision extraction pass. The judge in Phase 5 catches this (low score → gap identified → patch loop fills it via `get_region_description` tool calls).
+**New approach (`_extract_text_page_vision`):**
+- `full_page_extract()` reads the visual layout directly → assigns `##`/`###` headings in one pass
+- Same function now handles `text_rich`, `image_heavy`, and `mixed` pages when vision is available
+- `layout_hints()` and `_build_layout_context()` functions deleted entirely
 
-**See:** [[docs/ARCHITECTURE.md]] §Phase 3 extraction · [[docs/MODULES.md]] §page_profiler
+**Routing in practice:**
+- If vision available: ALL pages use `_extract_text_page_vision()` — vision reads layout and headings
+- If vision unavailable: `text_rich`/`table_heavy`/`scanned` fall back to pdfplumber/OCR
+
+**Phase 5 (Judge) still runs vision on every page** — this is unchanged.
+
+**See:** [[docs/ARCHITECTURE.md]] §Phase 3 extraction · [[docs/MODULES.md]] §page_profiler · [[docs/MODULES.md]] §parser_agent
 
 ---
 
@@ -373,6 +401,30 @@ cloak/
 **What stays in `ingestion/`:** legacy files `pdf_extractor.py`, `pdf_classifier.py`, `vision.py`, `markdown_builder.py` — read-only, untouched.
 
 **Implementation order:** restructure → verify imports → then add new modules.
+
+---
+
+## D27 — Phase 9: post-pipeline deep quality review (gemma4:latest)
+
+**Decision:** After the pipeline completes and all models are unloaded via `teardown_pdf()`, a larger review model (`gemma4:latest`, 9.6 GB) is loaded to compare the raw pdfplumber text (ground truth) against the final markdown and write an actionable quality improvement report.
+
+**Why:** The pipeline's judge (qwen2.5vl:7b) scores completeness per page during extraction. But after all rounds complete, there is no final holistic check comparing what pdfplumber actually saw in the text layer vs what ended up in the markdown. A post-pipeline auditor with a larger context and no VRAM constraints catches structural gaps, missing headings, and table issues that the per-page judge scores in aggregate may not surface.
+
+**Memory strategy:** `teardown_pdf()` unloads all pipeline models (~6 GB VRAM freed). `gemma4:latest` at 9.6 GB exceeds available VRAM but Ollama automatically places it across GPU VRAM + CPU RAM (CPU+GPU split). No code change needed for the split.
+
+**Output:** `{stem}_review.md` in same directory as `final.md`. Structured report with: Missing Content, Wrong/Missing Headings, Table Issues, Duplicate Content, Formatting Problems, Overall Assessment, Quality Score (0–10), Priority Fixes.
+
+**Config:**
+```python
+DEEP_REVIEW_MODEL   = "gemma4:latest"  # 9.6 GB
+DEEP_REVIEW_TIMEOUT = 600              # 10 min — CPU+GPU split is slower
+```
+
+**Opt-out:** `cloak parse --no-review` skips Phase 9. Default is to run it.
+
+**Implementation:** `cloak/quality/deep_review.py` — `run(pdf_path, pages, final_markdown, review_out, console) -> Path | None`. Always calls `_unload()` in finally block regardless of success.
+
+**See:** [[docs/MODULES.md]] §11 · [[ARCHITECTURE.md]] §Full pipeline
 
 ---
 

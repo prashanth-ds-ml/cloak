@@ -1,14 +1,13 @@
 ---
 type: module-specs
-updated: 2026-05-16 (Session 7)
+updated: 2026-05-16 (Session 8)
 ---
 
 # Module Specs — cloak
 
 > Related: [[docs/ARCHITECTURE.md]] · [[docs/MODELS.md]] · [[docs/DECISIONS.md]] · [[docs/PROGRESS.md]]
 
-**Existing modules** (written, wired, move pending — D26): `pdf_tools`, `vision_tools`, `quality_judge`, `model_router`, `context_manager`, `parser_agent`.
-**New modules** (planned): `page_profiler`, `ocr_tools`, `system_check`, `cli/main.py`.
+**All 11 modules done.** `pdf_tools`, `vision_tools`, `quality_judge`, `model_router`, `context_manager`, `parser_agent`, `page_profiler`, `ocr_tools`, `system_check`, `cli/main.py`, `deep_review`.
 **Legacy files** (`pdf_extractor.py`, `pdf_classifier.py`, `vision.py`, `markdown_builder.py`): read-only, stay in `ingestion/`.
 
 ---
@@ -42,17 +41,19 @@ TableData(rows, page_num)            # .to_markdown() → markdown table string
 
 ---
 
-## 2 · vision/vision_tools.py ✅ done — prompts need generalisation
+## 2 · vision/vision_tools.py ✅ done
 
-**Purpose:** All Ollama vision calls in one place. Thin wrappers with daemon-thread timeouts.
+**Purpose:** All Ollama vision calls in one place. Thin wrappers with daemon-thread timeouts. All prompts are domain-neutral (D16).
 
-### Key functions
+### Public API
 ```python
-full_page_extract(image, model, timeout) -> str   # full page → markdown
+full_page_extract(image, model, timeout) -> str   # full page → markdown (headings from visual layout)
 region_describe(image, label, model, timeout) -> str  # ECG/diagram → description
 judge_quality(page_image, extracted_md, model, timeout) -> dict
     # returns: {"score": float, "gaps": [str], "action": "accept"|"patch"|"fallback"}
 ```
+
+`layout_hints()` was removed in Session 8 — heading detection now happens inside `full_page_extract()` directly (D23 update). `_build_layout_context()` in parser_agent was also removed.
 
 ### Image handling
 - All images resized to long edge ≤ `MAX_IMAGE_PX` (1024px) before encoding as PNG
@@ -66,11 +67,6 @@ VisionCallError      # Ollama returned an error (e.g. insufficient RAM)
 
 ### JSON fallback in judge_quality
 If model returns non-JSON, strips markdown fences and retries `json.loads`. On failure: returns `{"score": 0.0, "gaps": ["JSON parse failed"], "action": "patch"}` — never crashes.
-
-### Pending — next session
-- Generalize all prompts: remove "medical document parser" language → domain-neutral (D16)
-- Add `format_markdown(raw_text, model, timeout) -> str` — qwen3:8b FORMAT call (D20)
-- See [[MODELS.md]] §Prompts for the updated prompt text
 
 ---
 
@@ -179,43 +175,62 @@ If summarise call times out → returns `"[Summary unavailable — timeout]"` an
 
 ---
 
-## 6 · orchestration/parser_agent.py ✅ done — 8-phase pipeline implemented
+## 6 · orchestration/parser_agent.py ✅ done — 9-phase pipeline
 
-**Purpose:** Orchestrator. Runs the full 8-phase pipeline. CLI entry point.
+**Purpose:** Orchestrator. Runs the full 9-phase pipeline. CLI entry point.
 
-### Entry points
-```bash
-python -m cloak.orchestration.parser_agent data/raw/cardiology/heart_failure.pdf
-```
+### Entry point
 ```python
 from cloak.orchestration.parser_agent import parse
-parse("data/raw/cardiology/heart_failure.pdf")
+parse(pdf_path: Path, deep_review: bool = True)
 ```
 
-### 8-phase loop (target — D14 + D19 + D20 + D21 + D23 + D24)
+### 9-phase pipeline (D14 + D19 + D20 + D21 + D23 + D24 + D27)
 ```
-Phase 0  intake: load_pages(), create output dir
-Phase 1  profiler: profile_all(pages) → RouteMap
-Phase 3  extract: _extract_by_route(pages, route_map) — vision only for image_heavy/mixed (D23)
-Phase 4  format:  qwen3:8b FORMAT session (D20) — once
-Phase 5  judge:   quality_judge per page — every round (D21/D24)
-Phase 6  patch:   qwen3:8b PATCH — targeted (D5 guard)
-         repeat phases 5–6 up to MAX_ROUNDS, best round wins (D2/D3)
-Phase 8  output:  final.md + confidence_report.md (D24)
+Phase 0  intake:    load_pages(), create output dir, create images_dir
+Phase 1  profiler:  profile_all(pages) → RouteMap
+Phase 3  extract:   _extract_by_route(pages, route_map, images_dir)
+           → ALL pages use vision when available (D23 updated)
+           → text_rich: _extract_text_page_vision() — full_page_extract for headings
+           → image_heavy/mixed: _extract_text_page_vision() — full page + region describe
+           → table_heavy: _extract_table_page()
+           → scanned: _extract_scanned_page()
+Phase 4  format:    qwen3:8b FORMAT session (D20) — once; /no_think prefix; FORMAT_NUM_CTX=8192
+Phase 5  judge:     quality_judge per page — every round (D24)
+Phase 6  patch:     qwen3:8b PATCH — targeted (D5 guard)
+          repeat phases 5–6 up to MAX_ROUNDS, best round wins (D2/D3)
+Phase 8  output:    final.md + confidence_report.md (D24) + images logged
 model_router.teardown_pdf()
+Phase 9  deep review: deep_review.run() — gemma4:latest CPU+GPU split (D27)
 ```
+
+### Extraction functions
+```python
+_extract_by_route(pages, route_map, images_dir=None) -> str        # dispatcher
+_extract_text_page_vision(pg, model, images_dir=None) -> str       # vision for ANY page type
+_extract_text_page(pg) -> str                                       # pdfplumber fallback (no vision)
+_extract_table_page(pg) -> str                                      # pdfplumber tables
+_extract_scanned_page(pg) -> str                                    # Tesseract OCR
+_extract_mixed_page(pg, model, images_dir=None) -> str             # text + vision for regions
+_extract_vision_page(pg, model, images_dir=None) -> str            # image_heavy full-page
+```
+
+### Region image persistence
+```python
+_images_dir(md_path: Path) -> Path    # returns {stem}_images/ dir, creates if needed
+_save_region(image, images_dir, page_num, label, idx) -> Path  # saves PNG, returns relative path
+```
+Region crops saved as `{stem}_images/page_{n}_{label}_{i}.png`. Embedded in markdown as `![label](relative_path)`.
 
 ### Output
 ```
 data/markdown/{specialty}/{stem}.md
 data/markdown/{specialty}/{stem}_confidence.md
-```
-
-### 2-step extract cascade (`_extract_all_pages`) — D14/D15
-```
-1. sticky model          → mark_success on win
-2. raw text blocks       → pg.text + table markdown + region placeholders
-   (llama3.2-vision:11b is NOT attempted for full-page OCR — times out on this hardware)
+data/markdown/{specialty}/{stem}_review.md    ← Phase 9 (if deep_review=True)
+data/markdown/{specialty}/{stem}_images/      ← region crops (if any regions found)
+  page_0_ecg_0.png
+  page_3_diagram_0.png
+  ...
 ```
 
 ### Tool-calling tools (qwen3:8b patch loop)
@@ -228,9 +243,9 @@ data/markdown/{specialty}/{stem}_confidence.md
 | `finish(markdown)` | Signal patch complete, return final markdown |
 
 ### FORMAT session (qwen3:8b — Phase 4, once — D20)
-Single `ollama.chat()` completion call — no tool loop. Input: raw_content string. Output: structured markdown.
+Single `ollama.chat()` completion call — no tool loop. Input: raw_content string. Output: structured markdown. Context: `FORMAT_NUM_CTX = 8192` (larger than standard to prevent qwen3 thinking tokens truncating output).
 
-System prompt instructs: preserve ALL content, add headings/lists/tables, fix spacing. Content-loss guard (D5) reverts if formatted output < 65% of input length. Long documents are processed up to `MODEL_NUM_CTX * 3` chars; the unformatted tail is appended so no content is silently dropped.
+System prompt starts with `/no_think` (suppresses qwen3 thinking chain). 6 rules: content from pre-structured vision output → dedup → preserve headings/levels → tables → merge abbreviation lists → no preamble. Content-loss guard (D5) reverts if output < 65% of input.
 
 ### Content-loss guard
 After every format or patch: `if len(new) < len(old) * 0.65` → revert. Configured via `config.CONTENT_LOSS_LIMIT`.
@@ -332,7 +347,7 @@ OCR_LANG = "eng"  # add to config.py — extend to "eng+hin" etc. if needed
 
 ## 9 · cli/system_check.py ✅ done
 
-**Purpose:** Hardware probe + model suitability display at startup. RAM gate before parsing begins.
+**Purpose:** Hardware probe + VRAM-aware model suitability display at startup. Startup memory cleanup. RAM gate before parsing begins.
 
 **Location:** `cloak/cli/system_check.py` — imported as `from cloak.cli import system_check`
 
@@ -345,29 +360,40 @@ get_total_vram_gb() -> float            # nvidia-smi --query-gpu=memory.total
 get_gpu_name() -> str                   # nvidia-smi --query-gpu=name
 is_ollama_running() -> bool             # GET /api/tags — returns False on any error
 get_installed_models() -> list[str]     # GET /api/tags → model name list
-check_model_suitability(model, free_ram_gb) -> dict
-    # {"model": str, "status": "ready"|"marginal"|"unavailable", "reason": str, "required_gb": float}
-show_startup_screen() -> None           # banner + hardware grid + model status table
+check_model_suitability(model, free_ram_gb, free_vram_gb=0.0) -> dict
+    # VRAM-aware priority: GPU → CPU+GPU → CPU → marginal → unavailable
+    # returns: {"model", "status", "backend", "note", "reason", "required_vram_gb", "required_ram_gb"}
+show_startup_screen(show_commands=False) -> None  # banner + hardware grid + model status table
+run_startup_cleanup() -> None            # unload idle Ollama models; show top procs if RAM tight
 ram_gate(min_gb=MIN_FREE_RAM_GB) -> bool  # warns if low, never blocks
+get_top_processes(n=6, min_mb=250) -> list[dict]  # top N processes by RAM for memory hint
 ```
 
-All functions are safe to call anytime — never raise; failures return sentinel values (0.0, "unknown", []) and print a warning.
+All functions are safe to call anytime — never raise; failures return sentinel values (0.0, "unknown", []).
 
-### Model RAM requirements (from [[DECISIONS.md]] §D18)
-| Model | Min free RAM needed | Role |
-|---|---|---|
-| `qwen2.5vl:7b` | 9.0 GB | Vision primary |
-| `qwen3:8b` | 5.5 GB | Orchestrator |
-| `llama3.2-vision:11b` | 11.0 GB | Vision fallback |
+### VRAM-aware suitability (Session 8 — D18)
+`check_model_suitability()` now accepts `free_vram_gb`. Priority:
+1. GPU — fits fully in VRAM → `ready (GPU)`
+2. CPU+GPU split — VRAM + RAM covers model → `ready (CPU+GPU)`
+3. CPU — no GPU but RAM sufficient → `ready (CPU)` (yellow)
+4. Marginal (≥ 85% of needed) → `marginal`
+5. Otherwise → `unavailable`
 
-Marginal threshold: free_ram ≥ required × 0.85.
+### Model requirements (Session 8)
+| Model | VRAM needed | RAM needed | Role |
+|---|---|---|---|
+| `qwen2.5vl:7b` | 7.3 GB | 9.0 GB | Vision primary |
+| `qwen3:8b` | 5.2 GB | 5.5 GB | Orchestrator |
+| `qwen3-vl:4b` | 3.5 GB | 4.5 GB | Vision fallback |
 
 ### RAM gate behaviour
-If `free_ram < MIN_FREE_RAM_GB` (9.0 GB): print warning, return `False`. Never blocks execution — let the runtime probe (`_probe_vision`) decide.
+If both VRAM and RAM are insufficient for `VISION_PRIMARY`: print warning, return `False`. Never blocks execution — let the runtime probe (`_probe_vision`) decide.
+
+### Startup screen visibility (D17 update)
+`show_startup_screen(show_commands=True)` — called only on bare `cloak`. `show_startup_screen()` (no commands) — called only on `cloak status`. NOT called on `cloak parse` or `cloak list`.
 
 ### Dependencies
 - `psutil` (in pyproject.toml)
-- `typer` (in pyproject.toml)
 - `subprocess` — for `nvidia-smi` calls
 - `httpx` — for Ollama API calls
 - `rich` — for display
@@ -376,20 +402,21 @@ If `free_ram < MIN_FREE_RAM_GB` (9.0 GB): print warning, return `False`. Never b
 
 ## 10 · cli/main.py ✅ done
 
-**Purpose:** typer CLI entry point. Shows startup screen on every invocation.
+**Purpose:** typer CLI entry point. Startup screen only on bare `cloak` and `cloak status` (D17 updated).
 
 ### Commands
 ```
-cloak                    → startup screen + command list
-cloak parse <pdf|dir>    → parse single PDF or all PDFs in a directory
-cloak status             → hardware + model status only
+cloak                    → run_startup_cleanup() + show_startup_screen(show_commands=True)
+cloak parse <pdf|dir>    → parse single PDF or all PDFs; no startup screen; supports --no-review
+cloak status             → run_startup_cleanup() + show_startup_screen()
 cloak list               → table of data/markdown/ contents with size + date + confidence flag
 ```
 
 ### parse command behaviour
 - Accepts a file (`*.pdf`) or directory (recursively finds all `.pdf` files)
-- Shows startup screen first (hardware + model status)
-- Parses each PDF via `orchestration.parser_agent.parse()`
+- Does NOT show startup screen (removed in Session 8 — reduces noise in parse output)
+- `--no-review` flag skips Phase 9 deep review (`deep_review=False` passed to `parse()`)
+- Parses each PDF via `orchestration.parser_agent.parse(pdf, deep_review=not no_review)`
 - Collects errors per file — reports failures at the end, does not abort on first error
 
 ### Package entry point (`pyproject.toml`)
@@ -401,3 +428,62 @@ cloak = "cloak.cli.main:app"
 ### Dependencies
 - `typer>=0.12.0` (in pyproject.toml)
 - `rich` — for table display in `cloak list`
+
+---
+
+## 11 · quality/deep_review.py ✅ done — Phase 9
+
+**Purpose:** Post-pipeline deep quality review. Loads `gemma4:latest` after all pipeline models are unloaded, compares raw pdfplumber text (ground truth) vs final AI-processed markdown, writes actionable quality improvement report. See [[docs/DECISIONS.md]] §D27.
+
+### Entry point
+```python
+from cloak.quality import deep_review as dr
+rev_path = dr.run(
+    pdf_path: Path,
+    pages: list,           # list[PageData] — still in memory after pipeline
+    final_markdown: str,
+    review_out: Path,      # {stem}_review.md path
+    console,               # rich Console
+) -> Path | None           # returns path written, or None if failed
+```
+
+### Internal functions
+```python
+_call(raw_text: str, final_md: str) -> str
+    # Truncates inputs to 10,000 chars each
+    # Calls DEEP_REVIEW_MODEL via daemon thread with DEEP_REVIEW_TIMEOUT
+    # Returns review text
+
+_unload() -> None
+    # POST keep_alive=0 to Ollama API for DEEP_REVIEW_MODEL
+    # Always called in finally block — model never left loaded
+```
+
+### Report structure
+```markdown
+# Quality Review — {pdf_name}
+**Model:** `gemma4:latest`  ·  **Pages reviewed:** N
+
+---
+## Missing Content
+## Wrong or Missing Headings
+## Table Issues
+## Duplicate Content
+## Formatting Problems
+## Overall Assessment
+## Quality Score
+Score: X/10
+## Priority Fixes
+```
+
+### Memory strategy
+Called after `model_router.teardown_pdf()` — all pipeline models unloaded. `gemma4:latest` (9.6 GB) exceeds pure VRAM but Ollama places it automatically across GPU + CPU RAM. No explicit split management needed.
+
+### Config
+```python
+DEEP_REVIEW_MODEL   = "gemma4:latest"   # config.py
+DEEP_REVIEW_TIMEOUT = 600               # 10 min — CPU+GPU split is slower
+```
+
+### Error behaviour
+If `DEEP_REVIEW_MODEL` is not installed or call fails: prints warning, returns `None`. Parse output is unaffected — review is best-effort.

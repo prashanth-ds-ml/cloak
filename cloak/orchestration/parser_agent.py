@@ -17,7 +17,6 @@ D6 (context cap), D19 (extract-once), D20 (FORMAT before patch), D23 (selective 
 """
 from __future__ import annotations
 
-import io
 import json
 import queue
 import sys
@@ -29,17 +28,14 @@ import ollama
 from PIL import Image
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-
-# Force UTF-8 stdout on Windows so Rich spinner chars don't crash in cp1252 terminals
-if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
 
 console = Console()
 
 from cloak.config import (
     AGENT_TIMEOUT,
     CONTENT_LOSS_LIMIT,
+    FORMAT_NUM_CTX,
     MAX_AGENT_ITERS,
     MAX_ROUNDS,
     MD_DIR,
@@ -154,6 +150,7 @@ def _execute_tool(
     args: dict,
     pages: list[PageData],
     draft: str,
+    images_dir: Path | None = None,
 ) -> tuple[str, str]:
     """Execute a tool call from the orchestrator. Returns (result_text, updated_draft)."""
     if name == "get_page_text":
@@ -175,6 +172,9 @@ def _execute_tool(
         try:
             desc = vision_tools.region_describe(region.image, region.label, model=m)
             model_router.mark_success(m)
+            if images_dir is not None:
+                rel = _save_region(region.image, images_dir, page_num, region.label, region_index)
+                return f"![{region.label}]({rel})\n\n{desc}", draft
             return desc, draft
         except Exception as exc:
             return f"Region description failed: {exc}", draft
@@ -219,6 +219,7 @@ def _run_patch_loop(
     draft: str,
     gaps: list[str],
     messages: list[dict],
+    images_dir: Path | None = None,
 ) -> str:
     """Run the qwen3:8b tool-calling loop to fill gaps. Returns updated markdown."""
     gap_text = "\n".join(f"- {g}" for g in gaps[:20])
@@ -287,7 +288,7 @@ def _run_patch_loop(
             except (json.JSONDecodeError, TypeError):
                 fn_args = {}
 
-            tool_result, current_draft = _execute_tool(fn_name, fn_args, pages, current_draft)
+            tool_result, current_draft = _execute_tool(fn_name, fn_args, pages, current_draft, images_dir)
             messages.append({"role": "tool", "content": tool_result})
 
             if tool_result == "__FINISH__":
@@ -299,19 +300,77 @@ def _run_patch_loop(
 # ── Phase 3: Per-page extraction strategies ───────────────────────────────────
 
 def _extract_text_page(pg: PageData) -> str:
-    """text_rich: PyMuPDF text + pdfplumber tables."""
-    parts = [pg.text] if pg.text.strip() else []
-    for tbl in pg.tables:
-        parts.append(tbl.to_markdown())
-    return "\n\n".join(parts)
+    """
+    Pdfplumber-only extraction: raw text + tables with dedup marker.
+    Used as fallback (no vision) and as the text base inside _extract_mixed_page.
+    """
+    parts: list[str] = []
+    if pg.text.strip():
+        parts.append(pg.text.strip())
+    table_mds = [tbl.to_markdown() for tbl in pg.tables if tbl.to_markdown().strip()]
+    if table_mds:
+        parts.append(
+            "<!-- TABLES: structured form of page content — use these, remove any duplicate prose above -->"
+        )
+        parts.extend(table_mds)
+    return "\n\n".join(p for p in parts if p)
+
+
+def _extract_text_page_vision(
+    pg: PageData,
+    model: str,
+    images_dir: Path | None = None,
+) -> str:
+    """
+    text_rich with vision: full_page_extract reads the page image and assigns ##/### headings
+    from the visual layout in a single pass — no separate layout-hints call needed.
+    Region crops (ECGs, figures) are described in detail and saved alongside.
+    pdfplumber tables appended as a supplement for reliable cell content.
+    Falls back to _extract_text_page() on vision failure.
+    """
+    if pg.image is None:
+        return _extract_text_page(pg)
+
+    try:
+        parts = [vision_tools.full_page_extract(pg.image, model=model)]
+        model_router.mark_success(model)
+    except (vision_tools.VisionTimeoutError, vision_tools.VisionCallError) as exc:
+        console.print(
+            f"  [yellow]Vision failed page {pg.page_num}: {type(exc).__name__}"
+            f" — text fallback[/yellow]"
+        )
+        return _extract_text_page(pg)
+
+    # Detailed specialist descriptions for embedded image regions
+    for i, r in enumerate(pg.regions):
+        try:
+            desc = vision_tools.region_describe(r.image, r.label, model=model)
+            model_router.mark_success(model)
+            if images_dir is not None:
+                rel = _save_region(r.image, images_dir, r.page_num, r.label, i)
+                parts.append(f"![{r.label}]({rel})\n\n{desc}")
+            else:
+                parts.append(desc)
+        except Exception as exc:
+            parts.append(
+                f"<!-- region {i}: {r.label} — description failed: {type(exc).__name__} -->"
+            )
+
+    # pdfplumber tables: more reliable than vision for exact cell content
+    table_mds = [tbl.to_markdown() for tbl in pg.tables if tbl.to_markdown().strip()]
+    if table_mds:
+        parts.append(
+            "<!-- TABLES: structured form of page content — use these, remove any duplicate prose above -->"
+        )
+        parts.extend(table_mds)
+
+    return "\n\n".join(p for p in parts if p)
 
 
 def _extract_table_page(pg: PageData) -> str:
-    """table_heavy: pdfplumber tables first, then surrounding text."""
-    parts = [tbl.to_markdown() for tbl in pg.tables]
-    if pg.text.strip():
-        parts.append(pg.text)
-    return "\n\n".join(parts) if parts else pg.text
+    """table_heavy: pdfplumber tables only — raw text excluded to prevent duplication."""
+    table_mds = [tbl.to_markdown() for tbl in pg.tables if tbl.to_markdown().strip()]
+    return "\n\n".join(table_mds) if table_mds else pg.text.strip()
 
 
 def _extract_scanned_page(pg: PageData) -> str:
@@ -344,14 +403,22 @@ def _extract_vision_page(pg: PageData, model: str) -> str:
         return _extract_text_page(pg)
 
 
-def _extract_mixed_page(pg: PageData, model: str) -> str:
+def _extract_mixed_page(
+    pg: PageData,
+    model: str,
+    images_dir: Path | None = None,
+) -> str:
     """mixed: PyMuPDF text + pdfplumber tables + region vision for image blocks."""
     md = _extract_text_page(pg)
     for i, r in enumerate(pg.regions):
         try:
             desc = vision_tools.region_describe(r.image, r.label, model=model)
             model_router.mark_success(model)
-            md += f"\n\n{desc}"
+            if images_dir is not None:
+                rel = _save_region(r.image, images_dir, r.page_num, r.label, i)
+                md += f"\n\n![{r.label}]({rel})\n\n{desc}"
+            else:
+                md += f"\n\n{desc}"
         except Exception as exc:
             md += (
                 f"\n\n<!-- region {i}: {r.label} — vision failed: {type(exc).__name__} -->"
@@ -363,37 +430,46 @@ def _extract_by_route(
     pages: list[PageData],
     route_map: dict[int, str],
     vision_available: bool,
+    on_page_done=None,
+    images_dir: Path | None = None,
 ) -> str:
     """
     Phase 3: dispatch each page to its extraction strategy based on RouteMap.
-    Vision is called only for image_heavy and mixed pages (D23).
-    Scanned pages always use OCR regardless of vision availability.
+
+    text_rich + vision  → _extract_text_page_vision  (full_page_extract assigns ##/### headings)
+    image_heavy + vision → _extract_vision_page       (full_page_extract)
+    mixed + vision       → _extract_mixed_page        (text + region vision)
+    table_heavy          → _extract_table_page        (pdfplumber tables)
+    scanned              → _extract_scanned_page      (Tesseract OCR)
+    no-vision fallback   → _extract_text_page         (pdfplumber text)
     """
     parts: list[str] = []
     model = model_router.get_vision_model() if vision_available else ""
 
     for pg in pages:
         page_type = route_map.get(pg.page_num, "text_rich")
-        console.print(
-            f"  [dim]Page {pg.page_num + 1}/{len(pages)}: {page_type}[/dim]",
-            highlight=False,
-        )
 
         if page_type == "scanned":
             md = _extract_scanned_page(pg)
         elif page_type == "image_heavy" and vision_available:
             md = _extract_vision_page(pg, model)
         elif page_type == "mixed" and vision_available:
-            md = _extract_mixed_page(pg, model)
+            md = _extract_mixed_page(pg, model, images_dir=images_dir)
         elif page_type == "table_heavy":
             md = _extract_table_page(pg)
+        elif page_type == "text_rich" and vision_available:
+            # Vision reads visual layout → headings embedded in output, no post-hoc hint pass
+            md = _extract_text_page_vision(pg, model, images_dir=images_dir)
         else:
+            # No vision or unsupported type: pdfplumber text only
             md = _extract_text_page(pg)
             if page_type in ("image_heavy", "mixed") and not vision_available:
                 for i, r in enumerate(pg.regions):
                     md += f"\n\n<!-- image region {i}: {r.label} (vision unavailable) -->"
 
         parts.append(md)
+        if on_page_done is not None:
+            on_page_done(pg.page_num, page_type)
 
     return "\n\n---\n\n".join(parts)
 
@@ -401,22 +477,43 @@ def _extract_by_route(
 # ── Phase 4: FORMAT step ──────────────────────────────────────────────────────
 
 _FORMAT_SYSTEM = """\
-You are a document formatter. Convert the raw extracted text below into clean, well-structured markdown.
-Preserve ALL content — do not remove, summarise, or paraphrase any information.
-Add appropriate headings, lists, tables, and code blocks where they improve readability.
-Fix spacing and paragraph breaks. Output ONLY the formatted markdown, nothing else."""
+/no_think
+You are a document formatter. The input is already structured markdown extracted from a PDF \
+by a vision model — headings (## and ###) are already present from the visual layout.
+Your job is to clean and consolidate, not to reconstruct structure.
+
+Rules:
+
+1. DEDUPLICATE — The input may contain this marker:
+   <!-- TABLES: structured form of page content — use these, remove any duplicate prose above -->
+   When you see it: keep the TABLE version, delete the prose above the marker that duplicates it.
+   Never output the same information as both bullets/prose AND as a table.
+
+2. HEADINGS — Preserve ## and ### headings exactly as they appear. Do not re-level or remove them.
+
+3. MARKDOWN TABLES — Ensure correct syntax: header row, then | --- | --- | separator, then data rows.
+   Use <br> for multi-line content inside cells.
+
+4. ABBREVIATIONS — Merge ALL abbreviation lists found anywhere in the document into ONE table at the end:
+   | Abbreviation | Definition |
+   | --- | --- |
+   Remove the original scattered lists; keep only this single merged table.
+
+5. Preserve ALL unique content. Do not summarise, paraphrase, or omit any information.
+6. Output ONLY the formatted markdown — no preamble, no closing remarks."""
 
 
 def _run_format_session(raw_content: str) -> str:
     """
-    Phase 4: qwen3:8b restructures raw extraction into clean markdown (D20).
-    Long documents are chunked at the context budget; the unformatted tail is appended
-    so no content is silently dropped.
+    Phase 4: qwen3:8b cleans and consolidates pre-structured markdown (D20).
+    Content already has ##/### headings from vision extraction — FORMAT deduplicates and tidies.
     Falls back to raw_content on failure, timeout, or content-loss (D5).
     """
-    char_cap = MODEL_NUM_CTX * 3   # rough chars that fit within token budget
+    char_cap = FORMAT_NUM_CTX * 3   # rough chars that fit within token budget
     content_in = raw_content[:char_cap]
     truncated = len(raw_content) > char_cap
+
+    user_msg = f"Clean and consolidate this extracted document:\n\n{content_in}"
 
     result_q: queue.Queue = queue.Queue()
 
@@ -426,9 +523,9 @@ def _run_format_session(raw_content: str) -> str:
                 model=ORCHESTRATOR_MODEL,
                 messages=[
                     {"role": "system", "content": _FORMAT_SYSTEM},
-                    {"role": "user", "content": f"Format this document:\n\n{content_in}"},
+                    {"role": "user", "content": user_msg},
                 ],
-                options={"temperature": 0.1, "num_ctx": MODEL_NUM_CTX},
+                options={"temperature": 0.1, "num_ctx": FORMAT_NUM_CTX},
                 keep_alive=MODEL_KEEP_ALIVE,
             )
             result_q.put(("ok", resp))
@@ -452,7 +549,7 @@ def _run_format_session(raw_content: str) -> str:
         return raw_content
 
     if not _content_loss_ok(content_in, formatted):
-        console.print("  [yellow]FORMAT content-loss guard triggered — reverting to raw[/yellow]")
+        console.print("  [yellow]FORMAT content-loss guard — output too short, reverting to raw[/yellow]")
         return raw_content
 
     if truncated:
@@ -467,6 +564,7 @@ def _content_loss_ok(original: str, updated: str) -> bool:
     if not original:
         return True
     return len(updated) >= len(original) * (1 - CONTENT_LOSS_LIMIT)
+
 
 
 # ── Output paths ──────────────────────────────────────────────────────────────
@@ -487,6 +585,30 @@ def _output_path(pdf_path: Path) -> Path:
 
 def _confidence_path(md_path: Path) -> Path:
     return md_path.with_name(md_path.stem + "_confidence.md")
+
+
+def _review_path(md_path: Path) -> Path:
+    return md_path.with_name(md_path.stem + "_review.md")
+
+
+def _images_dir(pdf_path: Path) -> Path:
+    """Return {output_dir}/{stem}_images/ for region crop PNGs. Created lazily on first save."""
+    out = _output_path(pdf_path)
+    return out.parent / f"{out.stem}_images"
+
+
+def _save_region(
+    img: Image.Image,
+    images_dir: Path,
+    page_num: int,
+    label: str,
+    idx: int,
+) -> str:
+    """Save a region crop as PNG. Returns the relative markdown path (images_dir.name/filename)."""
+    images_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"p{page_num + 1}_{label}_{idx}.png"
+    img.save(str(images_dir / filename), format="PNG")
+    return f"{images_dir.name}/{filename}"
 
 
 # ── Confidence report ─────────────────────────────────────────────────────────
@@ -531,10 +653,20 @@ def _probe_vision() -> bool:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def parse(pdf_path: Path | str) -> str:
+_ROUTE_LABELS = {
+    "text_rich":   "vision extraction (headings from visual layout)",
+    "table_heavy": "pdfplumber tables",
+    "image_heavy": "full-page vision",
+    "mixed":       "text + region vision",
+    "scanned":     "Tesseract OCR",
+}
+
+
+def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
     """
     Full 8-phase agentic parse pipeline. Returns best-scoring markdown string.
     Writes final.md and confidence_report.md to data/markdown/{specialty}/.
+    deep_review: if True, runs Phase 9 (DEEP_REVIEW_MODEL) after pipeline teardown.
     """
     pdf_path = Path(pdf_path)
     console.print(Panel.fit(
@@ -543,59 +675,84 @@ def parse(pdf_path: Path | str) -> str:
     ))
 
     # Phase 0: Load
-    console.print("\n[bold]Phase 0[/bold]  Loading ...")
+    console.rule("[bold cyan]Phase 0[/bold cyan]  Load", align="left", style="dim")
     pages = load_pages(pdf_path)
-    console.print(f"  {len(pages)} page(s) loaded")
+    pg_word = "page" if len(pages) == 1 else "pages"
+    console.print(f"  {len(pages)} {pg_word} loaded")
+    images_dir = _images_dir(pdf_path)
 
     # Phase 1: Profile (heuristic, no model)
-    console.print("\n[bold]Phase 1[/bold]  Profiling ...")
+    console.rule("[bold cyan]Phase 1[/bold cyan]  Profile", align="left", style="dim")
     profiles = profile_all(pages)
     route_map = build_route_map(profiles)
     counts = summarise_profiles(profiles)
-    console.print(f"  {counts}")
+    for ptype, n in sorted(counts.items()):
+        console.print(f"  [dim]·[/dim] {ptype}: {n}")
 
     # Phase 2: Routing display
-    console.print("\n[bold]Phase 2[/bold]  Routing plan:")
+    console.rule("[bold cyan]Phase 2[/bold cyan]  Route", align="left", style="dim")
     for ptype, cnt in sorted(counts.items()):
-        console.print(f"    {cnt}x {ptype}")
+        label = _ROUTE_LABELS.get(ptype, ptype)
+        console.print(f"  [dim]{cnt}×[/dim] {ptype}  →  [dim]{label}[/dim]")
 
     model_router.reset()
     vision_available = _probe_vision()
     if not vision_available:
         console.print(
-            "[yellow]Vision model unavailable — image/diagram regions will be skipped.[/yellow]"
+            "  [yellow]Vision unavailable — image/diagram regions will be skipped[/yellow]"
         )
 
     # Phase 3: Selective extraction — extract-once, D19/D23
-    console.print("\n[bold]Phase 3[/bold]  Extracting ...")
+    console.rule("[bold cyan]Phase 3[/bold cyan]  Extract", align="left", style="dim")
     if vision_available:
         model_router.before_vision_phase()
 
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-        task = p.add_task("Extracting pages ...", total=None)
-        raw_content = _extract_by_route(pages, route_map, vision_available)
-        p.update(task, description=f"Extracted {len(raw_content)} chars")
+    with Progress(
+        SpinnerColumn(), BarColumn(), MofNCompleteColumn(),
+        TextColumn("{task.description}"), console=console,
+    ) as p:
+        extract_task = p.add_task("Extracting", total=len(pages))
+        def _on_page_done(page_num: int, page_type: str) -> None:
+            p.update(extract_task, advance=1, description=f"[dim]{page_type}[/dim]")
+        raw_content = _extract_by_route(pages, route_map, vision_available, _on_page_done, images_dir=images_dir)
 
     # Switch to orchestrator for Phase 4 (unloads vision if active)
     model_router.before_orchestrator_phase()
 
     # Phase 4: FORMAT once — D20
-    console.print("\n[bold]Phase 4[/bold]  Formatting ...")
+    # Content already has ##/### headings from vision extraction; FORMAT cleans + deduplicates
+    console.rule("[bold cyan]Phase 4[/bold cyan]  Format", align="left", style="dim")
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
         task = p.add_task("Formatting ...", total=None)
         markdown = _run_format_session(raw_content)
-        p.update(task, description=f"Formatted: {len(markdown)} chars")
-
-    console.print(f"  {len(raw_content)} → {len(markdown)} chars")
+        p.update(task, description=f"Done: {len(raw_content):,} → {len(markdown):,} chars")
 
     # Text-only path: skip judge-patch loop (no vision for judging)
     if not vision_available:
         out_path = _output_path(pdf_path)
         out_path.write_text(markdown, encoding="utf-8")
-        console.print(
-            f"\n[bold green]Done (text-only).[/bold green] Output: [cyan]{out_path}[/cyan]"
-        )
+        console.print(Panel.fit(
+            f"[bold green]Done (text-only)[/bold green]\n"
+            f"[dim]Output:[/dim]  [cyan]{out_path}[/cyan]",
+            border_style="green", padding=(0, 1),
+        ))
         model_router.teardown_pdf()
+
+        if deep_review:
+            from cloak.config import DEEP_REVIEW_MODEL
+            from cloak.quality import deep_review as dr
+            console.rule("[bold cyan]Phase 9[/bold cyan]  Deep Review", align="left", style="dim")
+            console.print(f"  Loading [cyan]{DEEP_REVIEW_MODEL}[/cyan]  (CPU+GPU split)")
+            rev_path = dr.run(
+                pdf_path=pdf_path,
+                pages=pages,
+                final_markdown=markdown,
+                review_out=_review_path(out_path),
+                console=console,
+            )
+            if rev_path:
+                console.print(f"  [green]Review written:[/green] [cyan]{rev_path}[/cyan]")
+
         return markdown
 
     # Phases 5–6: Judge + Patch loop — no re-extraction (D19)
@@ -605,7 +762,10 @@ def parse(pdf_path: Path | str) -> str:
     messages: list[dict] = [{"role": "system", "content": _PATCH_SYSTEM}]
 
     for round_num in range(1, MAX_ROUNDS + 1):
-        console.print(f"\n[bold]Round {round_num}/{MAX_ROUNDS}[/bold]  Judge + Patch")
+        console.rule(
+            f"[bold]Round {round_num}/{MAX_ROUNDS}[/bold]  Judge + Patch",
+            align="left", style="dim",
+        )
 
         # Phase 5: Judge (vision model)
         model_router.before_vision_phase()
@@ -626,7 +786,8 @@ def parse(pdf_path: Path | str) -> str:
             p.update(task, description=f"Score: {avg_score:.1f}/10  action={action}")
 
         console.print(
-            f"  Score: [bold]{avg_score:.1f}/10[/bold]  action=[yellow]{action}[/yellow]"
+            f"  Score: [bold]{avg_score:.1f}/10[/bold]  "
+            f"action=[{'green' if action == 'accept' else 'yellow'}]{action}[/{'green' if action == 'accept' else 'yellow'}]"
         )
 
         if avg_score > best.score:
@@ -647,12 +808,12 @@ def parse(pdf_path: Path | str) -> str:
 
         console.print(f"  Patching {len(all_gaps)} gap(s) ...")
         messages = context_manager.compress_history(messages)
-        updated = _run_patch_loop(pages, markdown, all_gaps, messages)
+        updated = _run_patch_loop(pages, markdown, all_gaps, messages, images_dir=images_dir)
 
         if not _content_loss_ok(markdown, updated):
             console.print(
                 f"  [red]Content-loss guard triggered "
-                f"({len(markdown)}→{len(updated)} chars) — reverting[/red]"
+                f"({len(markdown):,}→{len(updated):,} chars) — reverting[/red]"
             )
         else:
             markdown = updated
@@ -667,14 +828,41 @@ def parse(pdf_path: Path | str) -> str:
         encoding="utf-8",
     )
 
-    console.print(
-        f"\n[bold green]Done.[/bold green] Best round: {best.round_num}  "
-        f"Score: {best.score:.1f}/10"
+    saved_count = len(list(images_dir.glob("*.png"))) if images_dir.exists() else 0
+    images_line = (
+        f"\n[dim]Images:[/dim]      [cyan]{images_dir}[/cyan] ({saved_count} saved)"
+        if saved_count else ""
     )
-    console.print(f"Output:     [cyan]{out_path}[/cyan]")
-    console.print(f"Confidence: [cyan]{conf_path}[/cyan]")
+    console.print(Panel.fit(
+        f"[bold green]Done[/bold green]   Best: round {best.round_num}   "
+        f"Score: [bold]{best.score:.1f}/10[/bold]\n"
+        f"[dim]Output:[/dim]      [cyan]{out_path}[/cyan]\n"
+        f"[dim]Confidence:[/dim]  [cyan]{conf_path}[/cyan]"
+        + images_line,
+        border_style="green", padding=(0, 1),
+    ))
 
+    # Unload all pipeline models before Phase 9
     model_router.teardown_pdf()
+
+    # Phase 9: Deep quality review — loads DEEP_REVIEW_MODEL (CPU+GPU split)
+    if deep_review:
+        from cloak.config import DEEP_REVIEW_MODEL
+        from cloak.quality import deep_review as dr
+
+        console.rule("[bold cyan]Phase 9[/bold cyan]  Deep Review", align="left", style="dim")
+        console.print(f"  Loading [cyan]{DEEP_REVIEW_MODEL}[/cyan]  (CPU+GPU split, may take a moment)")
+
+        rev_path = dr.run(
+            pdf_path=pdf_path,
+            pages=pages,
+            final_markdown=best.markdown,
+            review_out=_review_path(out_path),
+            console=console,
+        )
+        if rev_path:
+            console.print(f"  [green]Review written:[/green] [cyan]{rev_path}[/cyan]")
+
     return best.markdown
 
 

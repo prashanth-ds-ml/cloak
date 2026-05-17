@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import typer
@@ -21,6 +22,18 @@ app = typer.Typer(
 console = Console()
 
 
+def _format_size(path: Path) -> str:
+    b = path.stat().st_size
+    return f"{b // 1048576} MB" if b >= 1048576 else f"{b // 1024} KB"
+
+
+def _format_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s"
+
+
 @app.callback(invoke_without_command=True)
 def startup(ctx: typer.Context) -> None:
     """Show hardware + model status (default when no subcommand is given)."""
@@ -35,6 +48,7 @@ def startup(ctx: typer.Context) -> None:
 def parse(
     path: Path = typer.Argument(..., help="PDF file or directory of PDFs to parse"),
     no_review: bool = typer.Option(False, "--no-review", help="Skip Phase 9 deep quality review"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List PDFs that would be parsed without parsing"),
 ) -> None:
     """Parse a PDF file or all PDFs in a directory."""
     from cloak.orchestration.parser_agent import parse as do_parse
@@ -49,27 +63,75 @@ def parse(
         if not pdfs:
             console.print(f"[yellow]No PDF files found in {path}[/yellow]")
             raise typer.Exit(1)
-        console.print(f"Found [bold]{len(pdfs)}[/bold] PDF(s) in [cyan]{path}[/cyan]\n")
+
+        # Show file list
+        console.print(
+            f"Found [bold]{len(pdfs)}[/bold] PDF(s) in [cyan]{path}[/cyan]"
+        )
+        for pdf in pdfs:
+            console.print(f"  [dim]·[/dim] {pdf.name:<45} {_format_size(pdf)}")
+        console.print()
+
+        if dry_run:
+            raise typer.Exit()
+
     elif path.suffix.lower() == ".pdf":
         pdfs = [path]
+        if dry_run:
+            console.print(f"  [dim]·[/dim] {path.name}  {_format_size(path)}")
+            raise typer.Exit()
     else:
         console.print(f"[red]{path} is not a PDF file or directory[/red]")
         raise typer.Exit(1)
 
-    errors: list[tuple[Path, str]] = []
+    # Track per-file results for batch summary
+    results: list[dict] = []
+    errors:  list[tuple[Path, str]] = []
+    batch_t0 = time.monotonic()
+
     for i, pdf in enumerate(pdfs, 1):
         if len(pdfs) > 1:
-            console.rule(f"[dim]{i}/{len(pdfs)}: {pdf.name}[/dim]")
+            console.rule(f"[dim][{i}/{len(pdfs)}] {pdf.name}[/dim]")
+
+        file_t0 = time.monotonic()
         try:
             do_parse(pdf, deep_review=not no_review)
+            results.append({
+                "name":    pdf.stem,
+                "elapsed": time.monotonic() - file_t0,
+                "status":  "ok",
+            })
         except Exception as exc:
             console.print(f"[red]Failed: {pdf.name} — {exc}[/red]")
             errors.append((pdf, str(exc)))
+            results.append({
+                "name":    pdf.stem,
+                "elapsed": time.monotonic() - file_t0,
+                "status":  "fail",
+            })
+
+    # Batch summary table (only for multi-file runs)
+    if len(pdfs) > 1:
+        total_elapsed = time.monotonic() - batch_t0
+        console.print()
+        tbl = Table(
+            title=f"Batch complete — {len(pdfs)} PDF(s)  "
+                  f"({len(errors)} failed)  "
+                  f"total {_format_elapsed(total_elapsed)}",
+            show_header=True,
+            header_style="bold dim",
+        )
+        tbl.add_column("File", style="cyan")
+        tbl.add_column("Time", justify="right")
+        tbl.add_column("", width=3)
+
+        for r in results:
+            icon = "[green]✓[/green]" if r["status"] == "ok" else "[red]✗[/red]"
+            tbl.add_row(r["name"], _format_elapsed(r["elapsed"]), icon)
+
+        console.print(tbl)
 
     if errors:
-        console.print(f"\n[red]{len(errors)} file(s) failed:[/red]")
-        for p, msg in errors:
-            console.print(f"  [red]✗[/red] {p.name}: {msg}")
         raise typer.Exit(1)
 
 
@@ -79,6 +141,23 @@ def status() -> None:
     from cloak.cli import system_check
     system_check.run_startup_cleanup()
     system_check.show_startup_screen()
+
+
+def _read_best_score(conf_path: Path) -> str:
+    """Extract the best score from a confidence report, colour-coded."""
+    if not conf_path.exists():
+        return "[dim]—[/dim]"
+    try:
+        import re
+        text = conf_path.read_text(encoding="utf-8")
+        scores = [float(m) for m in re.findall(r"\|\s*\w+\s*\|\s*([\d.]+)\s*\|", text)]
+        if not scores:
+            return "[dim]—[/dim]"
+        avg = sum(scores) / len(scores)
+        color = "green" if avg >= 8.0 else ("yellow" if avg >= 5.0 else "red")
+        return f"[{color}]{avg:.1f}[/{color}]"
+    except Exception:
+        return "[dim]?[/dim]"
 
 
 @app.command("list")
@@ -92,7 +171,11 @@ def list_docs() -> None:
         raise typer.Exit()
 
     md_files = sorted(
-        (f for f in MD_DIR.rglob("*.md") if not f.name.endswith("_confidence.md")),
+        (
+            f for f in MD_DIR.rglob("*.md")
+            if not any(f.name.endswith(s) for s in ("_confidence.md", "_review.md"))
+            and ".obsidian" not in f.parts
+        ),
         key=lambda f: f.stat().st_mtime,
         reverse=True,
     )
@@ -101,23 +184,66 @@ def list_docs() -> None:
         console.print(f"[dim]No parsed documents in {MD_DIR}[/dim]")
         raise typer.Exit()
 
-    tbl = Table(title=f"Parsed documents  ({MD_DIR})", show_header=True)
+    tbl = Table(title=f"Parsed documents  ({MD_DIR})", show_header=True, header_style="dim")
     tbl.add_column("File", style="cyan")
     tbl.add_column("Size", justify="right")
     tbl.add_column("Parsed", style="dim")
-    tbl.add_column("Confidence", style="dim")
+    tbl.add_column("Score", justify="right")
+    tbl.add_column("Review", justify="center")
 
     for f in md_files:
         stat = f.stat()
-        size = (
-            f"{stat.st_size // 1024} KB" if stat.st_size >= 1024 else f"{stat.st_size} B"
-        )
+        size  = f"{stat.st_size // 1024} KB" if stat.st_size >= 1024 else f"{stat.st_size} B"
         mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-        conf = f.with_name(f.stem + "_confidence.md")
-        has_conf = "[green]yes[/green]" if conf.exists() else "[dim]—[/dim]"
-        tbl.add_row(str(f.relative_to(MD_DIR)), size, mtime, has_conf)
+        conf  = f.with_name(f.stem + "_confidence.md")
+        rev   = f.with_name(f.stem + "_review.md")
+        score_str  = _read_best_score(conf)
+        review_str = "[green]✓[/green]" if rev.exists() else "[dim]—[/dim]"
+        tbl.add_row(str(f.relative_to(MD_DIR)), size, mtime, score_str, review_str)
 
     console.print(tbl)
+
+
+@app.command()
+def clean(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Remove all parsed output from data/markdown/."""
+    from cloak.config import MD_DIR
+    import shutil
+
+    if not MD_DIR.exists():
+        console.print(f"[dim]Nothing to clean — {MD_DIR} does not exist[/dim]")
+        raise typer.Exit()
+
+    md_files = list(MD_DIR.rglob("*.md"))
+    img_dirs  = [d for d in MD_DIR.rglob("*_images") if d.is_dir()]
+    total = len(md_files) + sum(
+        len(list(d.rglob("*"))) for d in img_dirs
+    )
+
+    if total == 0:
+        console.print(f"[dim]Nothing to clean in {MD_DIR}[/dim]")
+        raise typer.Exit()
+
+    console.print(
+        f"Will delete [bold]{len(md_files)}[/bold] markdown file(s) and "
+        f"[bold]{len(img_dirs)}[/bold] image folder(s) in [cyan]{MD_DIR}[/cyan]"
+    )
+
+    if not yes:
+        confirmed = typer.confirm("Proceed?", default=False)
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit()
+
+    for f in md_files:
+        if f.name != ".gitkeep":
+            f.unlink(missing_ok=True)
+    for d in img_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+    console.print(f"[green]✓[/green]  Cleaned {MD_DIR}")
 
 
 if __name__ == "__main__":

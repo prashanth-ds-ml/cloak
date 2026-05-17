@@ -1,19 +1,20 @@
 """
-parser_agent.py — 8-phase agentic PDF parse pipeline.
+parser_agent.py — 9-phase agentic PDF parse pipeline.
 
 Phases:
   0  load_pages          — PyMuPDF + pdfplumber, no model
   1  profile_all         — heuristic page classification, no model (D21)
   2  routing display     — console summary
-  3  _extract_by_route   — selective per-page extraction; vision only for image_heavy/mixed (D19/D23)
+  3  _extract_by_route   — vision for all page types when available (D23)
   4  _run_format_session — qwen3:8b FORMAT once before the judge-patch loop (D20)
-  5  quality_judge       — qwen2.5vl:7b judges all pages, produces PageScore list
+  5  quality_judge       — vision model judges all pages, produces PageScore list
   6  _run_patch_loop     — qwen3:8b fills gaps flagged by judge
   5–6 repeat up to MAX_ROUNDS; judge+patch only — no re-extraction (D19)
   8  write final.md + confidence_report.md
+  9  deep_review         — DEEP_REVIEW_MODEL audits final markdown (D27)
 
 Hard rules: D2 (best round wins), D3 (threshold 8.0), D5 (content-loss guard),
-D6 (context cap), D19 (extract-once), D20 (FORMAT before patch), D23 (selective vision).
+D6 (context cap), D19 (extract-once), D20 (FORMAT before patch), D23 (vision for all types).
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import json
 import queue
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +64,65 @@ class RoundResult:
     gaps: list[str]
     action: str
     page_scores: list[quality_judge.PageScore]
+
+
+# ── Phase checklist UI ────────────────────────────────────────────────────────
+
+class _PhaseUI:
+    """
+    Compact ticking-checklist display for parse phases.
+
+    Usage:
+        ui = _PhaseUI()
+        ui.begin("0", "Load")          # records start time, no output yet
+        ...do work...
+        ui.done("3 pages · 312 KB")    # prints: ✓  Phase 0  Load  3 pages · 312 KB  (0.1s)
+    """
+
+    _OK   = "[green]✓[/green]"
+    _WARN = "[yellow]⚠[/yellow]"
+    _FAIL = "[red]✗[/red]"
+    _SKIP = "[dim]–[/dim]"
+
+    def __init__(self) -> None:
+        self._phase_t0: float = time.monotonic()
+        self._label: str = ""
+
+    def begin(self, phase: str, name: str) -> None:
+        self._phase_t0 = time.monotonic()
+        self._label = f"[bold cyan]{phase}[/bold cyan]  [bold]{name}[/bold]"
+
+    def done(self, detail: str = "", *, warn: bool = False,
+             skip: bool = False, fail: bool = False) -> None:
+        icon = self._FAIL if fail else (self._SKIP if skip else (self._WARN if warn else self._OK))
+        elapsed = time.monotonic() - self._phase_t0
+        t_str   = f"  [dim]{elapsed:.1f}s[/dim]" if elapsed >= 0.5 else ""
+        d_str   = f"  [dim]{detail}[/dim]" if detail else ""
+        console.print(f"  {icon}  {self._label}{d_str}{t_str}")
+
+    def round_header(self, round_num: int, max_rounds: int) -> None:
+        console.print(f"\n  [bold]Round {round_num}/{max_rounds}[/bold]")
+
+    def score_line(self, avg: float, gaps: int, action: str,
+                   threshold: float, elapsed: float) -> None:
+        threshold_hit = avg >= threshold
+        score_color = "green" if avg >= 8.0 else ("yellow" if avg >= 5.0 else "red")
+        score_str = f"[{score_color}]{avg:.1f}/10[/{score_color}]"
+        threshold_str = (
+            f"  [green]✓ threshold {threshold} reached[/green]" if threshold_hit else ""
+        )
+        gap_str = f"  {gaps} gap{'s' if gaps != 1 else ''}"
+        t_str   = f"  [dim]{elapsed:.1f}s[/dim]" if elapsed >= 0.5 else ""
+        console.print(f"  {self._OK}  [bold cyan]Judge[/bold cyan]  {score_str}{gap_str}{threshold_str}{t_str}")
+
+    def patch_line(self, before: int, after: int, elapsed: float) -> None:
+        delta = after - before
+        sign  = "+" if delta >= 0 else ""
+        t_str = f"  [dim]{elapsed:.1f}s[/dim]" if elapsed >= 0.5 else ""
+        console.print(
+            f"  {self._OK}  [bold cyan]Patch[/bold cyan]"
+            f"  [dim]{after:,} chars ({sign}{delta:,})[/dim]{t_str}"
+        )
 
 
 # ── Tool definitions for qwen3:8b ─────────────────────────────────────────────
@@ -672,37 +733,39 @@ _ROUTE_LABELS = {
 
 def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
     """
-    Full 8-phase agentic parse pipeline. Returns best-scoring markdown string.
+    Full 9-phase agentic parse pipeline. Returns best-scoring markdown string.
     Writes final.md and confidence_report.md to data/markdown/{specialty}/.
     deep_review: if True, runs Phase 9 (DEEP_REVIEW_MODEL) after pipeline teardown.
     """
     pdf_path = Path(pdf_path)
+    file_kb   = pdf_path.stat().st_size // 1024
     console.print(Panel.fit(
-        f"[bold cyan]cloak[/bold cyan] — parsing [green]{pdf_path.name}[/green]",
+        f"[bold cyan]cloak[/bold cyan] — [green]{pdf_path.name}[/green]  "
+        f"[dim]{file_kb} KB[/dim]",
         border_style="cyan",
     ))
 
-    # Phase 0: Load
-    console.rule("[bold cyan]Phase 0[/bold cyan]  Load", align="left", style="dim")
+    ui = _PhaseUI()
+
+    # ── Phase 0: Load ─────────────────────────────────────────────────────────
+    ui.begin("0", "Load")
     pages = load_pages(pdf_path)
-    pg_word = "page" if len(pages) == 1 else "pages"
-    console.print(f"  {len(pages)} {pg_word} loaded")
     images_dir = _images_dir(pdf_path)
+    pg_word = "page" if len(pages) == 1 else "pages"
+    ui.done(f"{len(pages)} {pg_word} · {file_kb} KB")
 
-    # Phase 1: Profile (heuristic, no model)
-    console.rule("[bold cyan]Phase 1[/bold cyan]  Profile", align="left", style="dim")
-    profiles = profile_all(pages)
+    # ── Phase 1: Profile (heuristic, no model) ────────────────────────────────
+    ui.begin("1", "Profile")
+    profiles  = profile_all(pages)
     route_map = build_route_map(profiles)
-    counts = summarise_profiles(profiles)
-    for ptype, n in sorted(counts.items()):
-        console.print(f"  [dim]·[/dim] {ptype}: {n}")
+    counts    = summarise_profiles(profiles)
+    profile_summary = "  ".join(
+        f"{ptype}×{n}" for ptype, n in sorted(counts.items())
+    )
+    ui.done(profile_summary)
 
-    # Phase 2: Routing display
-    console.rule("[bold cyan]Phase 2[/bold cyan]  Route", align="left", style="dim")
-    for ptype, cnt in sorted(counts.items()):
-        label = _ROUTE_LABELS.get(ptype, ptype)
-        console.print(f"  [dim]{cnt}×[/dim] {ptype}  →  [dim]{label}[/dim]")
-
+    # ── Phase 2: Routing ──────────────────────────────────────────────────────
+    ui.begin("2", "Route")
     model_router.reset()
     vision_available = _probe_vision()
     if not vision_available:
@@ -710,76 +773,84 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
             "  [yellow]Vision unavailable — image/diagram regions will be skipped[/yellow]"
         )
 
-    # Phase 3: Selective extraction — extract-once, D19/D23
-    console.rule("[bold cyan]Phase 3[/bold cyan]  Extract", align="left", style="dim")
+    route_parts: list[str] = []
+    for ptype, cnt in sorted(counts.items()):
+        label = _ROUTE_LABELS.get(ptype, ptype)
+        route_parts.append(f"{cnt}× {ptype}")
+    ui.done("  ".join(route_parts))
+
+    # ── Phase 3: Extraction — extract-once, D19/D23 ───────────────────────────
+    ui.begin("3", "Extract")
     if vision_available:
         model_router.before_vision_phase()
 
+    extract_t0 = time.monotonic()
     with Progress(
         SpinnerColumn(), BarColumn(), MofNCompleteColumn(),
         TextColumn("{task.description}"), console=console,
     ) as p:
         extract_task = p.add_task("Extracting", total=len(pages))
+
         def _on_page_done(page_num: int, page_type: str) -> None:
             p.update(extract_task, advance=1, description=f"[dim]{page_type}[/dim]")
-        raw_content = _extract_by_route(pages, route_map, vision_available, _on_page_done, images_dir=images_dir)
 
-    # Switch to orchestrator for Phase 4 (unloads vision if active)
+        raw_content = _extract_by_route(
+            pages, route_map, vision_available, _on_page_done, images_dir=images_dir
+        )
+
+    extract_elapsed = time.monotonic() - extract_t0
+    vision_model = model_router.get_vision_model() if vision_available else "text-only"
+    ui._phase_t0 = extract_t0
+    ui.done(f"{vision_model} · {len(pages)}/{len(pages)} pages · {len(raw_content):,} chars")
+
+    # Switch to orchestrator for Phase 4
     model_router.before_orchestrator_phase()
 
-    # Phase 4: FORMAT once — D20
-    # Content already has ##/### headings from vision extraction; FORMAT cleans + deduplicates
-    console.rule("[bold cyan]Phase 4[/bold cyan]  Format", align="left", style="dim")
+    # ── Phase 4: FORMAT once — D20 ────────────────────────────────────────────
+    ui.begin("4", "Format")
+    fmt_t0 = time.monotonic()
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-        task = p.add_task("Formatting ...", total=None)
+        p.add_task("Formatting ...", total=None)
         markdown = _run_format_session(raw_content)
-        p.update(task, description=f"Done: {len(raw_content):,} → {len(markdown):,} chars")
+    fmt_elapsed = time.monotonic() - fmt_t0
 
-    # Text-only path: skip judge-patch loop (no vision for judging)
+    guard_ok = _content_loss_ok(raw_content, markdown)
+    guard_str = "" if guard_ok else "  [yellow]⚠ guard triggered — raw kept[/yellow]"
+    ui._phase_t0 = fmt_t0
+    ui.done(
+        f"{len(raw_content):,} → {len(markdown):,} chars{guard_str}",
+        warn=not guard_ok,
+    )
+
+    # ── Text-only path: skip judge-patch loop ─────────────────────────────────
     if not vision_available:
         out_path = _output_path(pdf_path)
         out_path.write_text(markdown, encoding="utf-8")
-        console.print(Panel.fit(
-            f"[bold green]Done (text-only)[/bold green]\n"
-            f"[dim]Output:[/dim]  [cyan]{out_path}[/cyan]",
-            border_style="green", padding=(0, 1),
-        ))
+
+        ui.begin("8", "Output")
+        ui.done(f"{out_path.name}")
+
         model_router.teardown_pdf()
 
         if deep_review:
-            from cloak.config import DEEP_REVIEW_MODEL
-            from cloak.quality import deep_review as dr
-            console.rule("[bold cyan]Phase 9[/bold cyan]  Deep Review", align="left", style="dim")
-            console.print(f"  Loading [cyan]{DEEP_REVIEW_MODEL}[/cyan]  (CPU+GPU split)")
-            rev_path = dr.run(
-                pdf_path=pdf_path,
-                pages=pages,
-                final_markdown=markdown,
-                review_out=_review_path(out_path),
-                console=console,
-            )
-            if rev_path:
-                console.print(f"  [green]Review written:[/green] [cyan]{rev_path}[/cyan]")
+            _run_phase9(pdf_path, pages, markdown, out_path, ui)
 
         return markdown
 
-    # Phases 5–6: Judge + Patch loop — no re-extraction (D19)
+    # ── Phases 5–6: Judge + Patch loop — no re-extraction (D19) ──────────────
     best = RoundResult(
         round_num=0, markdown=markdown, score=0.0, gaps=[], action="patch", page_scores=[]
     )
     messages: list[dict] = [{"role": "system", "content": _PATCH_SYSTEM}]
 
     for round_num in range(1, MAX_ROUNDS + 1):
-        console.rule(
-            f"[bold]Round {round_num}/{MAX_ROUNDS}[/bold]  Judge + Patch",
-            align="left", style="dim",
-        )
+        ui.round_header(round_num, MAX_ROUNDS)
 
-        # Phase 5: Judge (vision model)
+        # Phase 5: Judge
         model_router.before_vision_phase()
-
+        judge_t0 = time.monotonic()
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-            task = p.add_task("Judging quality ...", total=None)
+            p.add_task("Judging pages ...", total=None)
             page_scores = [
                 quality_judge.judge(
                     page_num=pg.page_num,
@@ -791,32 +862,25 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
                 for pg in pages
             ]
             avg_score, all_gaps, action = quality_judge.aggregate_page_results(page_scores)
-            p.update(task, description=f"Score: {avg_score:.1f}/10  action={action}")
-
-        console.print(
-            f"  Score: [bold]{avg_score:.1f}/10[/bold]  "
-            f"action=[{'green' if action == 'accept' else 'yellow'}]{action}[/{'green' if action == 'accept' else 'yellow'}]"
-        )
 
         if avg_score > best.score:
             best = RoundResult(round_num, markdown, avg_score, all_gaps, action, page_scores)
-            console.print(f"  [green]New best: round {round_num}  score {avg_score:.1f}[/green]")
+
+        ui.score_line(avg_score, len(all_gaps), action, QUALITY_THRESHOLD,
+                      time.monotonic() - judge_t0)
 
         if best.score >= QUALITY_THRESHOLD:
-            console.print(
-                f"  [green]Quality threshold {QUALITY_THRESHOLD} reached — stopping early[/green]"
-            )
             break
-
         if action == "accept" or round_num == MAX_ROUNDS:
             break
 
-        # Phase 6: Patch (orchestrator model)
+        # Phase 6: Patch
         model_router.before_orchestrator_phase()
-
-        console.print(f"  Patching {len(all_gaps)} gap(s) ...")
-        messages = context_manager.compress_history(messages)
-        updated = _run_patch_loop(pages, markdown, all_gaps, messages, images_dir=images_dir)
+        patch_t0 = time.monotonic()
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
+            p.add_task(f"Patching {len(all_gaps)} gap(s) ...", total=None)
+            messages = context_manager.compress_history(messages)
+            updated = _run_patch_loop(pages, markdown, all_gaps, messages, images_dir=images_dir)
 
         if not _content_loss_ok(markdown, updated):
             console.print(
@@ -826,52 +890,56 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
         else:
             markdown = updated
 
-    # Phase 8: Write output
-    out_path = _output_path(pdf_path)
-    out_path.write_text(best.markdown, encoding="utf-8")
+        ui.patch_line(len(best.markdown), len(markdown), time.monotonic() - patch_t0)
 
+    # ── Phase 8: Write output ─────────────────────────────────────────────────
+    ui.begin("8", "Output")
+    out_path  = _output_path(pdf_path)
     conf_path = _confidence_path(out_path)
+    out_path.write_text(best.markdown, encoding="utf-8")
     conf_path.write_text(
-        _build_confidence_report(best.page_scores, pdf_path.name),
-        encoding="utf-8",
+        _build_confidence_report(best.page_scores, pdf_path.name), encoding="utf-8"
     )
-
     saved_count = len(list(images_dir.glob("*.png"))) if images_dir.exists() else 0
-    images_line = (
-        f"\n[dim]Images:[/dim]      [cyan]{images_dir}[/cyan] ({saved_count} saved)"
-        if saved_count else ""
+    images_str  = f"  {saved_count} image(s)" if saved_count else ""
+    ui.done(
+        f"score {best.score:.1f}/10 · round {best.round_num}"
+        f"  →  {out_path.name}{images_str}"
     )
-    console.print(Panel.fit(
-        f"[bold green]Done[/bold green]   Best: round {best.round_num}   "
-        f"Score: [bold]{best.score:.1f}/10[/bold]\n"
-        f"[dim]Output:[/dim]      [cyan]{out_path}[/cyan]\n"
-        f"[dim]Confidence:[/dim]  [cyan]{conf_path}[/cyan]"
-        + images_line,
-        border_style="green", padding=(0, 1),
-    ))
 
-    # Unload all pipeline models before Phase 9
     model_router.teardown_pdf()
 
-    # Phase 9: Deep quality review — loads DEEP_REVIEW_MODEL (CPU+GPU split)
     if deep_review:
-        from cloak.config import DEEP_REVIEW_MODEL
-        from cloak.quality import deep_review as dr
-
-        console.rule("[bold cyan]Phase 9[/bold cyan]  Deep Review", align="left", style="dim")
-        console.print(f"  Loading [cyan]{DEEP_REVIEW_MODEL}[/cyan]  (CPU+GPU split, may take a moment)")
-
-        rev_path = dr.run(
-            pdf_path=pdf_path,
-            pages=pages,
-            final_markdown=best.markdown,
-            review_out=_review_path(out_path),
-            console=console,
-        )
-        if rev_path:
-            console.print(f"  [green]Review written:[/green] [cyan]{rev_path}[/cyan]")
+        _run_phase9(pdf_path, pages, best.markdown, out_path, ui)
 
     return best.markdown
+
+
+def _run_phase9(
+    pdf_path: Path,
+    pages: list,
+    final_markdown: str,
+    out_path: Path,
+    ui: _PhaseUI,
+) -> None:
+    """Phase 9: post-pipeline deep review (gemma4:latest). Always unloads model when done."""
+    from cloak.config import DEEP_REVIEW_MODEL
+    from cloak.quality import deep_review as dr
+
+    ui.begin("9", "Deep Review")
+    console.print(f"       [dim]Loading {DEEP_REVIEW_MODEL} (CPU+GPU split) ...[/dim]")
+
+    rev_path = dr.run(
+        pdf_path=pdf_path,
+        pages=pages,
+        final_markdown=final_markdown,
+        review_out=_review_path(out_path),
+        console=console,
+    )
+    if rev_path:
+        ui.done(f"{rev_path.name}")
+    else:
+        ui.done("skipped", skip=True)
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

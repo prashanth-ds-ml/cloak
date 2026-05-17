@@ -287,10 +287,10 @@ def show_startup_screen(show_commands: bool = False) -> None:
 
     # ── banner ────────────────────────────────────────────────────────────────
     _ASCII = (
-        "   ___  _    ___   ___  _  __\n"
-        "  / __|| |  / _ \\ / __|| |/ /\n"
-        " | (__ | |_| (_) | (__ | ' < \n"
-        "  \\___||____\\___/ \\___||_|\\_\\\n"
+        "[bold cyan]   ___  _    ___   ___  _  __[/bold cyan]\n"
+        "[bold cyan]  / __|| |  / _ \\ / __|| |/ /[/bold cyan]\n"
+        "[bold cyan] | (__ | |_| (_) | (__ | ' < [/bold cyan]\n"
+        "[bold cyan]  \\___||____\\___/ \\___||_|\\_\\[/bold cyan]\n"
         "  [dim]PDF → Markdown  ·  local-only[/dim]"
     )
     console.print(Panel.fit(_ASCII, border_style="cyan"))

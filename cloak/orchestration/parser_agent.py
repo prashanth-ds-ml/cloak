@@ -476,8 +476,7 @@ def _extract_by_route(
 
 # ── Phase 4: FORMAT step ──────────────────────────────────────────────────────
 
-_FORMAT_SYSTEM = """\
-/no_think
+_FORMAT_SYSTEM_BODY = """\
 You are a document formatter. The input is already structured markdown extracted from a PDF \
 by a vision model — headings (## and ###) are already present from the visual layout.
 Your job is to clean and consolidate, not to reconstruct structure.
@@ -502,6 +501,15 @@ Rules:
 5. Preserve ALL unique content. Do not summarise, paraphrase, or omit any information.
 6. Output ONLY the formatted markdown — no preamble, no closing remarks."""
 
+_NO_THINK_PREFIX = "/no_think\n"
+
+
+def _format_system_prompt() -> str:
+    """Prepend /no_think for qwen3 models (suppresses thinking chain)."""
+    if "qwen3" in ORCHESTRATOR_MODEL.lower():
+        return _NO_THINK_PREFIX + _FORMAT_SYSTEM_BODY
+    return _FORMAT_SYSTEM_BODY
+
 
 def _run_format_session(raw_content: str) -> str:
     """
@@ -522,7 +530,7 @@ def _run_format_session(raw_content: str) -> str:
             resp = ollama.chat(
                 model=ORCHESTRATOR_MODEL,
                 messages=[
-                    {"role": "system", "content": _FORMAT_SYSTEM},
+                    {"role": "system", "content": _format_system_prompt()},
                     {"role": "user", "content": user_msg},
                 ],
                 options={"temperature": 0.1, "num_ctx": FORMAT_NUM_CTX},

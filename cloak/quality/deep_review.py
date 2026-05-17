@@ -68,6 +68,18 @@ Numbered list, most impactful first, max 6 items.
 Each item: one sentence — what to fix and where."""
 
 
+def _is_model_installed(model: str) -> bool:
+    """Check if the model is available in Ollama without loading it."""
+    try:
+        import httpx
+        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+        names = [m["name"] for m in resp.json().get("models", [])]
+        return any(model == n or model.split(":")[0] == n.split(":")[0] for n in names)
+    except Exception:
+        return False
+
+
 def _call(raw_text: str, final_md: str) -> str:
     """Send raw text + final markdown to DEEP_REVIEW_MODEL. Returns the review text."""
     # Truncate to fit within a large context window
@@ -142,6 +154,13 @@ def run(
         if text:
             raw_parts.append(f"[Page {pg.page_num + 1}]\n{text}")
     raw_text = "\n\n---\n\n".join(raw_parts) if raw_parts else "(no pdfplumber text — image-only PDF)"
+
+    if not _is_model_installed(DEEP_REVIEW_MODEL):
+        console.print(
+            f"  [yellow]Deep review skipped — {DEEP_REVIEW_MODEL} not installed.[/yellow]\n"
+            f"  [dim]Install with: ollama pull {DEEP_REVIEW_MODEL}[/dim]"
+        )
+        return None
 
     try:
         body = _call(raw_text, final_markdown)

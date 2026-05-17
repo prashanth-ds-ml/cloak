@@ -286,11 +286,14 @@ def show_startup_screen(show_commands: bool = False) -> None:
     installed  = get_installed_models() if ollama_ok else []
 
     # ── banner ────────────────────────────────────────────────────────────────
-    console.print(Panel.fit(
-        "[bold cyan]cloak[/bold cyan]  [dim]PDF → Markdown[/dim]\n"
-        "[dim]Local-only · No data leaves your machine[/dim]",
-        border_style="cyan",
-    ))
+    _ASCII = (
+        "   ___  _    ___   ___  _  __\n"
+        "  / __|| |  / _ \\ / __|| |/ /\n"
+        " | (__ | |_| (_) | (__ | ' < \n"
+        "  \\___||____\\___/ \\___||_|\\_\\\n"
+        "  [dim]PDF → Markdown  ·  local-only[/dim]"
+    )
+    console.print(Panel.fit(_ASCII, border_style="cyan"))
 
     # ── hardware ──────────────────────────────────────────────────────────────
     hw = Table.grid(padding=(0, 2))

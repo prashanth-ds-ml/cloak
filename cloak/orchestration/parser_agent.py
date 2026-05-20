@@ -3,18 +3,19 @@ parser_agent.py — 9-phase agentic PDF parse pipeline.
 
 Phases:
   0  load_pages          — PyMuPDF + pdfplumber, no model
-  1  profile_all         — heuristic page classification, no model (D21)
-  2  routing display     — console summary
-  3  _extract_by_route   — vision for all page types when available (D23)
-  4  _run_format_session — qwen3:8b FORMAT once before the judge-patch loop (D20)
-  5  quality_judge       — vision model judges all pages, produces PageScore list
-  6  _run_patch_loop     — qwen3:8b fills gaps flagged by judge
-  5–6 repeat up to MAX_ROUNDS; judge+patch only — no re-extraction (D19)
-  8  write final.md + confidence_report.md
+  1  doc intelligence    — docling layout pass → DoclingPageMap (D29)
+                           heuristic page profiles → DocProfile → ParsePlan (D28)
+  2  model staging       — probe vision based on ParsePlan.model_tier (D28)
+  3  _extract_by_route   — docling path when available (D29); fallback: type-based (D23)
+  4  _run_format_session — qwen3:8b FORMAT once (D20)
+  5  quality_judge       — vision scores sampled pages; combined content+structure (D31)
+  6  _run_patch_loop     — qwen3:8b fills gaps
+  5–6 repeat up to ParsePlan.max_rounds; judge+patch only (D19)
+  8  write final.md + confidence_report.md + flagged.md
   9  deep_review         — DEEP_REVIEW_MODEL audits final markdown (D27)
 
 Hard rules: D2 (best round wins), D3 (threshold 8.0), D5 (content-loss guard),
-D6 (context cap), D19 (extract-once), D20 (FORMAT before patch), D23 (vision for all types).
+D6 (context cap), D19 (extract-once), D20 (FORMAT before patch), D28 (ParsePlan drives all).
 """
 from __future__ import annotations
 
@@ -38,6 +39,8 @@ from cloak.config import (
     AGENT_TIMEOUT,
     CONTENT_LOSS_LIMIT,
     FORMAT_NUM_CTX,
+    JUDGE_SKIP_THRESHOLD,
+    LOW_CONFIDENCE_THRESHOLD,
     MAX_AGENT_ITERS,
     MAX_ROUNDS,
     MD_DIR,
@@ -48,9 +51,22 @@ from cloak.config import (
 )
 from cloak.extraction.pdf_tools import PageData, load_pages
 from cloak.orchestration import context_manager, model_router
-from cloak.profiling.page_profiler import build_route_map, profile_all
+from cloak.profiling.doc_profiler import (
+    DoclingElement,
+    DoclingPageMap,
+    build_doc_profile,
+    build_parse_plan,
+    run_docling_pass,
+)
+from cloak.profiling.page_profiler import (
+    build_route_map,
+    profile_all,
+    update_vision_from_docling,
+)
 from cloak.profiling.page_profiler import summarise as summarise_profiles
 from cloak.quality import quality_judge
+from cloak.quality.quality_judge import QualityMetrics, compute_metrics
+from cloak import registry as _registry
 from cloak.vision import vision_tools
 
 
@@ -190,6 +206,24 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_page_elements",
+            "description": (
+                "Return the docling structural element map for a page: labels, heading levels, "
+                "and text. Use this to see the page skeleton (headings, tables, figures, "
+                "footnotes) before deciding which regions need patching."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_num": {"type": "integer", "description": "0-indexed page number"},
+                },
+                "required": ["page_num"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish",
             "description": "Signal that patching is complete. Returns the final markdown.",
             "parameters": {
@@ -212,8 +246,32 @@ def _execute_tool(
     pages: list[PageData],
     draft: str,
     images_dir: Path | None = None,
+    element_map: DoclingPageMap | None = None,
 ) -> tuple[str, str]:
     """Execute a tool call from the orchestrator. Returns (result_text, updated_draft)."""
+    if name == "get_page_elements":
+        page_num = int(args.get("page_num", 0))
+        if element_map is None:
+            return "Docling element map not available for this document.", draft
+        elements = element_map.get(page_num)
+        if not elements:
+            return f"No docling elements found for page {page_num}.", draft
+        lines = [f"Page {page_num} elements ({len(elements)} total):"]
+        for el in elements:
+            if el.label == "section_header":
+                lines.append(f"  - section_header [L{el.level}]: {el.text[:120]!r}")
+            elif el.label == "table":
+                rows = el.table_md.count("\n") if el.table_md else 0
+                lines.append(f"  - table: ({rows} rows markdown)")
+            elif el.label == "picture":
+                cap = f" caption={el.caption!r}" if el.caption else ""
+                lines.append(f"  - picture{cap}")
+            elif el.label == "footnote":
+                lines.append(f"  - footnote: {el.text[:80]!r}")
+            else:
+                lines.append(f"  - {el.label}: {el.text[:120]!r}")
+        return "\n".join(lines), draft
+
     if name == "get_page_text":
         page_num = int(args.get("page_num", 0))
         if page_num >= len(pages):
@@ -281,6 +339,7 @@ def _run_patch_loop(
     gaps: list[str],
     messages: list[dict],
     images_dir: Path | None = None,
+    element_map: DoclingPageMap | None = None,
 ) -> str:
     """Run the qwen3:8b tool-calling loop to fill gaps. Returns updated markdown."""
     gap_text = "\n".join(f"- {g}" for g in gaps[:20])
@@ -349,13 +408,112 @@ def _run_patch_loop(
             except (json.JSONDecodeError, TypeError):
                 fn_args = {}
 
-            tool_result, current_draft = _execute_tool(fn_name, fn_args, pages, current_draft, images_dir)
+            tool_result, current_draft = _execute_tool(
+                fn_name, fn_args, pages, current_draft, images_dir, element_map
+            )
             messages.append({"role": "tool", "content": tool_result})
 
             if tool_result == "__FINISH__":
                 return current_draft
 
     return current_draft
+
+
+# ── Docling extraction helpers ────────────────────────────────────────────────
+
+def _crop_normalized(
+    img: Image.Image,
+    bbox_norm: tuple[float, float, float, float],
+) -> Image.Image | None:
+    """Return a crop of img using normalised [0,1] bbox (l, t, r, b). None if degenerate."""
+    l, t, r, b = bbox_norm
+    if r <= l or b <= t:
+        return None
+    w, h = img.size
+    crop = img.crop((int(l * w), int(t * h), int(r * w), int(b * h)))
+    if crop.width < 4 or crop.height < 4:
+        return None
+    return crop
+
+
+def _extract_docling_page(
+    elements: list[DoclingElement],
+    pg: PageData,
+    vision_available: bool,
+    model: str,
+    images_dir: Path | None = None,
+) -> str:
+    """
+    Build structured markdown from a docling element map for one page (D29).
+    PageHeader/PageFooter are never in elements — discarded by run_docling_pass.
+    Figure regions: cropped using normalised bbox → vision region_describe.
+    Footnotes collected and appended at section end with --- separator.
+    """
+    parts: list[str] = []
+    footnotes: list[str] = []
+    fig_idx = 0
+
+    for el in elements:
+        label = el.label
+
+        if label == "title":
+            if el.text.strip():
+                parts.append(f"# {el.text}")
+
+        elif label == "section_header":
+            level = max(1, el.level or 1)
+            hashes = "#" * (level + 1)   # L1→##, L2→###, L3→####
+            if el.text.strip():
+                parts.append(f"{hashes} {el.text}")
+
+        elif label == "table":
+            if el.table_md.strip():
+                parts.append(el.table_md)
+
+        elif label == "picture":
+            if vision_available and pg.image is not None:
+                crop = _crop_normalized(pg.image, el.bbox_norm)
+                if crop is not None:
+                    try:
+                        desc = vision_tools.region_describe(crop, "figure", model=model)
+                        model_router.mark_success(model)
+                        if images_dir is not None:
+                            rel = _save_region(crop, images_dir, pg.page_num, "figure", fig_idx)
+                            block = f"![figure]({rel})\n\n{desc}"
+                        else:
+                            block = desc
+                        if el.caption:
+                            block += f"\n\n*{el.caption}*"
+                        parts.append(block)
+                    except Exception as exc:
+                        parts.append(
+                            f"<!-- figure {fig_idx}: vision failed ({type(exc).__name__}) -->"
+                        )
+                else:
+                    parts.append(f"<!-- figure {fig_idx}: degenerate bbox -->")
+            else:
+                caption = el.caption or f"figure {fig_idx}"
+                parts.append(f"<!-- figure: {caption} (vision unavailable) -->")
+            fig_idx += 1
+
+        elif label == "footnote":
+            if el.text.strip():
+                footnotes.append(el.text)
+
+        elif label == "formula":
+            if el.text.strip():
+                parts.append(f"`{el.text}`")
+
+        else:
+            # text, paragraph, list_item, reference, caption, code, etc.
+            if el.text.strip():
+                parts.append(el.text)
+
+    if footnotes:
+        parts.append("---\n**Footnotes**")
+        parts.extend(f"- {f}" for f in footnotes)
+
+    return "\n\n".join(p for p in parts if p.strip())
 
 
 # ── Phase 3: Per-page extraction strategies ───────────────────────────────────
@@ -493,16 +651,21 @@ def _extract_by_route(
     vision_available: bool,
     on_page_done=None,
     images_dir: Path | None = None,
+    element_map: DoclingPageMap | None = None,
 ) -> str:
     """
-    Phase 3: dispatch each page to its extraction strategy based on RouteMap.
+    Phase 3: dispatch each page to its extraction strategy.
 
-    text_rich + vision  → _extract_text_page_vision  (full_page_extract assigns ##/### headings)
-    image_heavy + vision → _extract_vision_page       (full_page_extract)
-    mixed + vision       → _extract_mixed_page        (text + region vision)
-    table_heavy          → _extract_table_page        (pdfplumber tables)
-    scanned              → _extract_scanned_page      (Tesseract OCR)
-    no-vision fallback   → _extract_text_page         (pdfplumber text)
+    Docling path (D29) — used when element_map is available and page is not scanned:
+      _extract_docling_page() — uses heading hierarchy, reading order, figure crops
+
+    Fallback routing (D23) — when docling unavailable:
+      text_rich + vision  → _extract_text_page_vision  (full_page_extract)
+      image_heavy + vision → _extract_vision_page       (full_page_extract)
+      mixed + vision       → _extract_mixed_page        (text + region vision)
+      table_heavy          → _extract_table_page        (pdfplumber tables)
+      scanned              → _extract_scanned_page      (surya→tesseract, D30)
+      no-vision fallback   → _extract_text_page         (pdfplumber text)
     """
     parts: list[str] = []
     model = model_router.get_vision_model() if vision_available else ""
@@ -510,19 +673,29 @@ def _extract_by_route(
     for pg in pages:
         page_type = route_map.get(pg.page_num, "text_rich")
 
-        if page_type == "scanned":
+        # Docling path: structured extraction for all non-scanned pages (D29)
+        if element_map is not None and pg.page_num in element_map and page_type != "scanned":
+            md = _extract_docling_page(
+                element_map[pg.page_num], pg, vision_available, model, images_dir
+            )
+
+        elif page_type == "scanned":
+            # Always use OCR for scanned pages — docling's do_ocr=False means no text there (D30)
             md = _extract_scanned_page(pg)
+
         elif page_type == "image_heavy" and vision_available:
             md = _extract_vision_page(pg, model)
+
         elif page_type == "mixed" and vision_available:
             md = _extract_mixed_page(pg, model, images_dir=images_dir)
+
         elif page_type == "table_heavy":
             md = _extract_table_page(pg)
+
         elif page_type == "text_rich" and vision_available:
-            # Vision reads visual layout → headings embedded in output, no post-hoc hint pass
             md = _extract_text_page_vision(pg, model, images_dir=images_dir)
+
         else:
-            # No vision or unsupported type: pdfplumber text only
             md = _extract_text_page(pg)
             if page_type in ("image_heavy", "mixed") and not vision_available:
                 for i, r in enumerate(pg.regions):
@@ -660,6 +833,64 @@ def _review_path(md_path: Path) -> Path:
     return md_path.with_name(md_path.stem + "_review.md")
 
 
+def _flagged_path(md_path: Path) -> Path:
+    return md_path.with_name(md_path.stem + "_flagged.md")
+
+
+def _write_flagged_pages(
+    page_scores: list[quality_judge.PageScore],
+    pages: list,
+    pdf_name: str,
+    flagged_path: Path,
+) -> int:
+    """
+    Write pages scoring below LOW_CONFIDENCE_THRESHOLD to a flagged report.
+    Each entry shows the judge gaps and raw pdfplumber source so the problem is
+    immediately visible. Returns number of pages flagged (0 = nothing written).
+    """
+    low = [ps for ps in page_scores if ps.score < LOW_CONFIDENCE_THRESHOLD]
+    if not low:
+        if flagged_path.exists():
+            flagged_path.unlink()  # clean up stale file from a prior run
+        return 0
+
+    low.sort(key=lambda ps: ps.page_num)
+    page_nums_str = ", ".join(str(ps.page_num + 1) for ps in low)
+
+    lines = [
+        f"# Flagged Pages — {pdf_name}",
+        "",
+        f"**{len(low)} page(s) scored below {LOW_CONFIDENCE_THRESHOLD}/10 and need review.**  ",
+        f"Pages: {page_nums_str}",
+        "",
+        "---",
+        "",
+    ]
+
+    for ps in low:
+        raw_text = (pages[ps.page_num].text.strip() if ps.page_num < len(pages) else "")
+        gaps_md  = "\n".join(f"- {g}" for g in ps.gaps) if ps.gaps else "- (no specific gaps recorded)"
+
+        lines += [
+            f"## Page {ps.page_num + 1}  ·  score {ps.score:.1f}/10",
+            "",
+            "**Gaps identified by judge:**",
+            gaps_md,
+            "",
+            "**Raw source text (pdfplumber):**",
+            "",
+            "```",
+            raw_text or "(no extractable text — image-only page)",
+            "```",
+            "",
+            "---",
+            "",
+        ]
+
+    flagged_path.write_text("\n".join(lines), encoding="utf-8")
+    return len(low)
+
+
 def _images_dir(pdf_path: Path) -> Path:
     """Return {output_dir}/{stem}_images/ for region crop PNGs. Created lazily on first save."""
     out = _output_path(pdf_path)
@@ -682,27 +913,93 @@ def _save_region(
 
 # ── Confidence report ─────────────────────────────────────────────────────────
 
-def _build_confidence_report(page_scores: list[quality_judge.PageScore], pdf_name: str) -> str:
-    lines = [
-        f"# Confidence Report — {pdf_name}",
-        "",
-        "| Page | Confidence | Score | Notes |",
-        "|---|---|---|---|",
-    ]
-    for ps in sorted(page_scores, key=lambda x: x.page_num):
-        notes = "; ".join(ps.gaps[:2]) if ps.gaps and ps.confidence != "High" else "—"
-        lines.append(f"| {ps.page_num + 1} | {ps.confidence} | {ps.score:.1f} | {notes} |")
+def _build_confidence_report(
+    page_scores: list[quality_judge.PageScore],
+    pdf_name: str,
+    metrics: QualityMetrics | None = None,
+) -> str:
+    lines = [f"# Confidence Report — {pdf_name}", ""]
+
+    if metrics is not None:
+        high_pages = sum(1 for ps in page_scores if ps.score >= QUALITY_THRESHOLD)
+        n_pages    = len(page_scores)
+        lines += [
+            "## Summary",
+            "",
+            "| Metric | Value |",
+            "|---|---|",
+        ]
+        if metrics.judged:
+            lines.append(f"| Judge Score | {metrics.judge_score:.1f} / 10 |")
+            lines.append(
+                f"| Coverage | {int(metrics.coverage_rate * 100)}%"
+                f" pages ≥ {QUALITY_THRESHOLD} ({high_pages}/{n_pages}) |"
+            )
+        lines.append(f"| Completeness | {int(metrics.completeness_ratio * 100)}% words captured |")
+        lines.append(f"| Structure | {metrics.heading_count} headings · {metrics.table_count} tables |")
+        if metrics.review_score is not None:
+            lines.append(f"| Review Score | {metrics.review_score:.1f} / 10 (gemma4) |")
+        lines += ["", "---", ""]
+
+    if page_scores:
+        lines += [
+            "## Per-Page Scores",
+            "",
+            "| Page | Confidence | Score | Notes |",
+            "|---|---|---|---|",
+        ]
+        for ps in sorted(page_scores, key=lambda x: x.page_num):
+            notes = "; ".join(ps.gaps[:2]) if ps.gaps and ps.confidence != "High" else "—"
+            lines.append(f"| {ps.page_num + 1} | {ps.confidence} | {ps.score:.1f} | {notes} |")
+    else:
+        lines.append("*Vision judge did not run — text-only extraction.*")
+
     return "\n".join(lines)
+
+
+def _print_metrics_summary(metrics: QualityMetrics) -> None:
+    from rich.table import Table as _Table
+
+    def _color(val: float, high: float, mid: float) -> str:
+        return "green" if val >= high else ("yellow" if val >= mid else "red")
+
+    tbl = _Table.grid(padding=(0, 3))
+    tbl.add_column(style="dim", no_wrap=True)
+    tbl.add_column(no_wrap=True)
+    tbl.add_column(style="dim", no_wrap=True)
+    tbl.add_column(no_wrap=True)
+
+    if metrics.judged:
+        jc = _color(metrics.judge_score, 8.0, 5.0)
+        js = f"[{jc}]{metrics.judge_score:.1f}/10[/{jc}]"
+        cov_pct = int(metrics.coverage_rate * 100)
+        cc = _color(metrics.coverage_rate, 0.8, 0.5)
+        cs = f"[{cc}]{cov_pct}%[/{cc}] [dim]pages ≥ 8.0[/dim]"
+        tbl.add_row("Judge", js, "Coverage", cs)
+
+    comp_pct = int(metrics.completeness_ratio * 100)
+    pc = _color(metrics.completeness_ratio, 0.85, 0.6)
+    ps_str = f"[{pc}]{comp_pct}%[/{pc}] [dim]words captured[/dim]"
+    struct_s = f"[dim]{metrics.heading_count} headings · {metrics.table_count} tables[/dim]"
+    tbl.add_row("Complete", ps_str, "Structure", struct_s)
+
+    if metrics.review_score is not None:
+        rc = _color(metrics.review_score, 8.0, 5.0)
+        rs = f"[{rc}]{metrics.review_score:.1f}/10[/{rc}] [dim](gemma4 deep review)[/dim]"
+        tbl.add_row("Review", rs, "", "")
+
+    console.print()
+    console.print(tbl)
+    console.print()
 
 
 # ── Vision probe ──────────────────────────────────────────────────────────────
 
 def _probe_vision() -> bool:
-    """Try VISION_PRIMARY then VISION_FALLBACK. Returns False only if both fail."""
-    from cloak.config import VISION_FALLBACK, VISION_PRIMARY
+    """Try vision models in VRAM-aware order. Returns False only if all fail."""
     tiny = Image.new("RGB", (8, 8), color=(255, 255, 255))
 
-    for model in (VISION_PRIMARY, VISION_FALLBACK):
+    for model in model_router.vision_models_to_try():
         try:
             vision_tools.full_page_extract(tiny, model=model, timeout=30)
             model_router.mark_success(model)
@@ -710,7 +1007,7 @@ def _probe_vision() -> bool:
             return True
         except vision_tools.VisionCallError:
             console.print(
-                f"  Vision probe: [yellow]{model}[/yellow] insufficient RAM — trying next"
+                f"  Vision probe: [yellow]{model}[/yellow] failed to load — trying next"
             )
         except vision_tools.VisionTimeoutError:
             model_router.mark_success(model)
@@ -723,22 +1020,36 @@ def _probe_vision() -> bool:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 _ROUTE_LABELS = {
-    "text_rich":   "vision extraction (headings from visual layout)",
-    "table_heavy": "pdfplumber tables",
-    "image_heavy": "full-page vision",
-    "mixed":       "text + region vision",
-    "scanned":     "Tesseract OCR",
+    "text_rich":   "docling structure",
+    "table_heavy": "docling tables",
+    "image_heavy": "docling + vision figures",
+    "mixed":       "docling + vision regions",
+    "scanned":     "surya OCR",
 }
 
 
-def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
+def parse(
+    pdf_path: Path | str,
+    deep_review: bool = True,
+    workspace: Path | None = None,
+) -> str:
     """
     Full 9-phase agentic parse pipeline. Returns best-scoring markdown string.
-    Writes final.md and confidence_report.md to data/markdown/{specialty}/.
-    deep_review: if True, runs Phase 9 (DEEP_REVIEW_MODEL) after pipeline teardown.
+    Writes final.md, confidence_report.md, and optionally flagged.md.
+    workspace: root for .cloak/registry.json (defaults to cwd).
     """
     pdf_path = Path(pdf_path)
-    file_kb   = pdf_path.stat().st_size // 1024
+    parse_t0 = time.monotonic()
+    file_kb  = pdf_path.stat().st_size // 1024
+
+    # Registry: open and mark in-progress before any work starts
+    _ws       = (workspace or Path.cwd()).resolve()
+    _reg, _ws = _registry.load(_ws)
+    _registry.upsert(_reg, pdf_path, _ws,
+                     status=_registry.PROCESSING,
+                     last_parsed=_registry.now_iso())
+    _registry.save(_reg, _ws)
+
     console.print(Panel.fit(
         f"[bold cyan]cloak[/bold cyan] — [green]{pdf_path.name}[/green]  "
         f"[dim]{file_kb} KB[/dim]",
@@ -754,28 +1065,48 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
     pg_word = "page" if len(pages) == 1 else "pages"
     ui.done(f"{len(pages)} {pg_word} · {file_kb} KB")
 
-    # ── Phase 1: Profile (heuristic, no model) ────────────────────────────────
+    # ── Phase 1: Doc intelligence — docling layout pass + DocProfile + ParsePlan ─
     ui.begin("1", "Profile")
     profiles  = profile_all(pages)
+
+    # Docling layout pass (D29) — zero Ollama calls, CPU-only
+    console.print("       [dim]Running docling layout analysis ...[/dim]")
+    element_map = run_docling_pass(pdf_path)
+    if element_map:
+        update_vision_from_docling(profiles, element_map)  # refine needs_vision (D29)
+
     route_map = build_route_map(profiles)
     counts    = summarise_profiles(profiles)
-    profile_summary = "  ".join(
-        f"{ptype}×{n}" for ptype, n in sorted(counts.items())
-    )
-    ui.done(profile_summary)
 
-    # ── Phase 2: Routing ──────────────────────────────────────────────────────
+    # Estimate model viability using total memory (VRAM + RAM) before the actual probe
+    _est_vram    = model_router._free_vram_gb()
+    _est_ram     = model_router._free_ram_gb()
+    _primary_sz  = model_router._MODEL_SIZE_GB.get(VISION_PRIMARY, 7.3)
+    _gpu_est     = (_est_vram + _est_ram) >= _primary_sz
+    doc_profile = build_doc_profile(profiles, element_map)
+    plan        = build_parse_plan(doc_profile, primary_viable=_gpu_est, use_docling=element_map is not None)
+    model_router.set_parse_plan(plan)
+
+    type_summary = "  ".join(f"{ptype}×{n}" for ptype, n in sorted(counts.items()))
+    docling_str  = f"  [green]docling[/green]:{len(element_map)} pages" if element_map else ""
+    plan_str     = f"  [dim][{doc_profile.size_tier} · {plan.max_rounds}r · {int(plan.judge_sample_rate * 100)}%][/dim]"
+    ui.done(type_summary + docling_str + plan_str)
+
+    # ── Phase 2: Model staging — probe based on ParsePlan.model_tier ──────────
     ui.begin("2", "Route")
     model_router.reset()
+    model_router.set_parse_plan(plan)   # re-set after reset()
     vision_available = _probe_vision()
     if not vision_available:
-        console.print(
-            "  [yellow]Vision unavailable — image/diagram regions will be skipped[/yellow]"
-        )
+        if plan.model_tier == "none":
+            console.print("  [dim]Vision skipped — document has no image content[/dim]")
+        else:
+            console.print(
+                "  [yellow]Vision unavailable — image/diagram regions will be skipped[/yellow]"
+            )
 
     route_parts: list[str] = []
     for ptype, cnt in sorted(counts.items()):
-        label = _ROUTE_LABELS.get(ptype, ptype)
         route_parts.append(f"{cnt}× {ptype}")
     ui.done("  ".join(route_parts))
 
@@ -795,7 +1126,8 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
             p.update(extract_task, advance=1, description=f"[dim]{page_type}[/dim]")
 
         raw_content = _extract_by_route(
-            pages, route_map, vision_available, _on_page_done, images_dir=images_dir
+            pages, route_map, vision_available, _on_page_done,
+            images_dir=images_dir, element_map=element_map,
         )
 
     extract_elapsed = time.monotonic() - extract_t0
@@ -824,7 +1156,8 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
 
     # ── Text-only path: skip judge-patch loop ─────────────────────────────────
     if not vision_available:
-        out_path = _output_path(pdf_path)
+        out_path  = _output_path(pdf_path)
+        conf_path = _confidence_path(out_path)
         out_path.write_text(markdown, encoding="utf-8")
 
         ui.begin("8", "Output")
@@ -832,9 +1165,30 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
 
         model_router.teardown_pdf()
 
+        review_score: float | None = None
         if deep_review:
-            _run_phase9(pdf_path, pages, markdown, out_path, ui)
+            review_score = _run_phase9(pdf_path, pages, markdown, out_path, ui)
 
+        metrics = compute_metrics([], pages, markdown, review_score)
+        conf_path.write_text(
+            _build_confidence_report([], pdf_path.name, metrics), encoding="utf-8"
+        )
+        _print_metrics_summary(metrics)
+
+        _registry.upsert(_reg, pdf_path, _ws,
+                         status=_registry.DONE,
+                         last_parsed=_registry.now_iso(),
+                         elapsed_seconds=round(time.monotonic() - parse_t0, 1),
+                         judge_score=None,
+                         review_score=review_score,
+                         completeness=metrics.completeness_ratio,
+                         flagged_pages=0,
+                         total_pages=len(pages),
+                         heading_count=metrics.heading_count,
+                         table_count=metrics.table_count,
+                         model="text-only",
+                         output_md=str(out_path))
+        _registry.save(_reg, _ws)
         return markdown
 
     # ── Phases 5–6: Judge + Patch loop — no re-extraction (D19) ──────────────
@@ -842,16 +1196,42 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
         round_num=0, markdown=markdown, score=0.0, gaps=[], action="patch", page_scores=[]
     )
     messages: list[dict] = [{"role": "system", "content": _PATCH_SYSTEM}]
+    # Pages that scored ≥ JUDGE_SKIP_THRESHOLD are not re-judged in later rounds.
+    carryover: dict[int, quality_judge.PageScore] = {}
 
-    for round_num in range(1, MAX_ROUNDS + 1):
-        ui.round_header(round_num, MAX_ROUNDS)
+    _max_rounds = plan.max_rounds
 
-        # Phase 5: Judge
+    for round_num in range(1, _max_rounds + 1):
+        ui.round_header(round_num, _max_rounds)
+
+        # Phase 5: Judge — skip already-excellent pages from round 1 onward
         model_router.before_vision_phase()
         judge_t0 = time.monotonic()
+        pages_not_carried = [pg for pg in pages if pg.page_num not in carryover]
+
+        # Adaptive sampling (D28): prioritise visual / complex pages
+        if plan.judge_sample_rate < 1.0:
+            import random as _rand
+            n_sample  = max(1, int(len(pages_not_carried) * plan.judge_sample_rate))
+            priority  = [p for p in pages_not_carried
+                         if route_map.get(p.page_num) in ("image_heavy", "mixed", "scanned", "table_heavy")]
+            remainder = [p for p in pages_not_carried if p not in set(priority)]
+            _rand.shuffle(remainder)
+            pages_to_judge = (priority + remainder)[:n_sample]
+        else:
+            pages_to_judge = pages_not_carried
+
+        skipped = len(pages) - len(pages_to_judge) - len(carryover)
+
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-            p.add_task("Judging pages ...", total=None)
-            page_scores = [
+            desc = f"Judging {len(pages_to_judge)}/{len(pages)} page(s)"
+            n_carried = len(carryover)
+            if n_carried:
+                desc += f" · {n_carried} carried (≥{JUDGE_SKIP_THRESHOLD:.0f})"
+            if skipped > 0:
+                desc += f" · {skipped} sampled out"
+            p.add_task(desc + " ...", total=None)
+            new_scores = [
                 quality_judge.judge(
                     page_num=pg.page_num,
                     page_image=pg.image,
@@ -859,9 +1239,16 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
                     round_num=round_num,
                     model=model_router.get_vision_model(),
                 )
-                for pg in pages
+                for pg in pages_to_judge
             ]
-            avg_score, all_gaps, action = quality_judge.aggregate_page_results(page_scores)
+
+        # Carry over high-scoring pages so they aren't re-judged next round
+        for ps in new_scores:
+            if ps.score >= JUDGE_SKIP_THRESHOLD:
+                carryover[ps.page_num] = ps
+
+        page_scores = new_scores + list(carryover.values())
+        avg_score, all_gaps, action = quality_judge.aggregate_page_results(page_scores)
 
         if avg_score > best.score:
             best = RoundResult(round_num, markdown, avg_score, all_gaps, action, page_scores)
@@ -871,7 +1258,7 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
 
         if best.score >= QUALITY_THRESHOLD:
             break
-        if action == "accept" or round_num == MAX_ROUNDS:
+        if action == "accept" or round_num == _max_rounds:
             break
 
         # Phase 6: Patch
@@ -880,7 +1267,10 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
             p.add_task(f"Patching {len(all_gaps)} gap(s) ...", total=None)
             messages = context_manager.compress_history(messages)
-            updated = _run_patch_loop(pages, markdown, all_gaps, messages, images_dir=images_dir)
+            updated = _run_patch_loop(
+                pages, markdown, all_gaps, messages,
+                images_dir=images_dir, element_map=element_map,
+            )
 
         if not _content_loss_ok(markdown, updated):
             console.print(
@@ -897,9 +1287,6 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
     out_path  = _output_path(pdf_path)
     conf_path = _confidence_path(out_path)
     out_path.write_text(best.markdown, encoding="utf-8")
-    conf_path.write_text(
-        _build_confidence_report(best.page_scores, pdf_path.name), encoding="utf-8"
-    )
     saved_count = len(list(images_dir.glob("*.png"))) if images_dir.exists() else 0
     images_str  = f"  {saved_count} image(s)" if saved_count else ""
     ui.done(
@@ -907,10 +1294,43 @@ def parse(pdf_path: Path | str, deep_review: bool = True) -> str:
         f"  →  {out_path.name}{images_str}"
     )
 
+    _used_model = model_router.get_vision_model() or "text-only"
     model_router.teardown_pdf()
 
+    review_score: float | None = None
     if deep_review:
-        _run_phase9(pdf_path, pages, best.markdown, out_path, ui)
+        review_score = _run_phase9(pdf_path, pages, best.markdown, out_path, ui)
+
+    metrics = compute_metrics(best.page_scores, pages, best.markdown, review_score)
+    conf_path.write_text(
+        _build_confidence_report(best.page_scores, pdf_path.name, metrics), encoding="utf-8"
+    )
+
+    flagged_count = _write_flagged_pages(
+        best.page_scores, pages, pdf_path.name, _flagged_path(out_path)
+    )
+    if flagged_count:
+        console.print(
+            f"  [yellow]⚠[/yellow]  [yellow]{flagged_count} page(s) flagged for review[/yellow]"
+            f"  [dim]→ {_flagged_path(out_path).name}[/dim]"
+        )
+
+    _print_metrics_summary(metrics)
+
+    _registry.upsert(_reg, pdf_path, _ws,
+                     status=_registry.FLAGGED if flagged_count else _registry.DONE,
+                     last_parsed=_registry.now_iso(),
+                     elapsed_seconds=round(time.monotonic() - parse_t0, 1),
+                     judge_score=metrics.judge_score,
+                     review_score=metrics.review_score,
+                     completeness=metrics.completeness_ratio,
+                     flagged_pages=flagged_count,
+                     total_pages=len(pages),
+                     heading_count=metrics.heading_count,
+                     table_count=metrics.table_count,
+                     model=_used_model,
+                     output_md=str(out_path))
+    _registry.save(_reg, _ws)
 
     return best.markdown
 
@@ -921,15 +1341,15 @@ def _run_phase9(
     final_markdown: str,
     out_path: Path,
     ui: _PhaseUI,
-) -> None:
-    """Phase 9: post-pipeline deep review (gemma4:latest). Always unloads model when done."""
+) -> float | None:
+    """Phase 9: post-pipeline deep review (gemma4:latest). Returns score or None."""
     from cloak.config import DEEP_REVIEW_MODEL
     from cloak.quality import deep_review as dr
 
     ui.begin("9", "Deep Review")
     console.print(f"       [dim]Loading {DEEP_REVIEW_MODEL} (CPU+GPU split) ...[/dim]")
 
-    rev_path = dr.run(
+    rev_path, rev_score = dr.run(
         pdf_path=pdf_path,
         pages=pages,
         final_markdown=final_markdown,
@@ -937,9 +1357,11 @@ def _run_phase9(
         console=console,
     )
     if rev_path:
-        ui.done(f"{rev_path.name}")
+        score_str = f" · {rev_score:.1f}/10" if rev_score is not None else ""
+        ui.done(f"{rev_path.name}{score_str}")
     else:
         ui.done("skipped", skip=True)
+    return rev_score
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

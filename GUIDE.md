@@ -251,7 +251,7 @@ cloak list
 | `Ollama is not running` | Run `ollama serve` in a separate terminal |
 | Vision `unavailable` in status | Free ≥ 9 GB RAM — close Chrome and heavy apps |
 | Scanned pages empty | Install Tesseract: `winget install UB-Mannheim.TesseractOCR` |
-| Parse is very slow | `MODEL_KEEP_ALIVE` in `config.py` is set to `0` — consider raising to `3600` to keep models warm between pages |
+| Parse is very slow | Vision model cold-loading — check that `MODEL_KEEP_ALIVE = -1` in `config.py` (models should stay loaded within a phase) |
 | Low confidence on all pages | Vision model not loading — check `cloak status` and free more RAM |
 | `ImportError` on first run | Run `pip install -e .` from the project root with the venv activated |
 
@@ -265,7 +265,7 @@ All tuning knobs are in `cloak/config.py`:
 |---|---|---|
 | `QUALITY_THRESHOLD` | `8.0` | Stop the judge loop early when score ≥ this |
 | `MAX_ROUNDS` | `4` | Maximum judge→patch iterations |
-| `MODEL_KEEP_ALIVE` | `0` | Seconds to keep model warm after each call (raise to `3600` if slow) |
+| `MODEL_KEEP_ALIVE` | `-1` | Model stays loaded until explicit phase-boundary unload — no cold reloads within a phase |
 | `VISION_TIMEOUT` | `400` | Seconds before a vision call is aborted |
 | `AGENT_TIMEOUT` | `150` | Seconds before an orchestrator call is aborted |
 | `PAGE_DPI` | `150` | Resolution for page rendering |

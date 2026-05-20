@@ -32,7 +32,7 @@ MIN_IMAGE_BYTES     = 5_000    # ignore images smaller than this
 MODEL_NUM_CTX       = 4096     # Ollama context window — lower saves VRAM
 FORMAT_NUM_CTX      = 8192     # larger context for Phase 4 FORMAT — avoids qwen3 thinking tokens truncating output
 MAX_IMAGE_PX        = 1024     # long-edge cap before sending image to VLM
-MODEL_KEEP_ALIVE    = 0        # keep_alive=0 — explicit phase-based unloads handle lifecycle (D11)
+MODEL_KEEP_ALIVE    = -1       # keep_alive=-1 — model stays loaded until explicit phase-boundary unload
 
 # ── System / hardware gate ──────────────────────────────────────────────────
 MIN_FREE_RAM_GB         = 9.0   # minimum free RAM to enable vision model (D18)
@@ -41,10 +41,16 @@ MIN_FREE_RAM_GB         = 9.0   # minimum free RAM to enable vision model (D18)
 SCANNED_TEXT_THRESHOLD  = 100   # chars below which a page is considered scanned (D21)
 IMAGE_AREA_THRESHOLD    = 0.4   # image area ratio above which a page is image_heavy (D21)
 
+# ── Quality gates ───────────────────────────────────────────────────────────
+LOW_CONFIDENCE_THRESHOLD = 5.0   # pages scoring below this are written to {stem}_flagged.md
+JUDGE_SKIP_THRESHOLD     = 9.0   # pages scoring ≥ this in round 1 are not re-judged in later rounds
+
 # ── Deep review (Phase 9) ───────────────────────────────────────────────────
 # Runs after pipeline models are unloaded. Larger model, Ollama handles CPU+GPU split.
 DEEP_REVIEW_MODEL   = "gemma4:latest"  # 9.6 GB — uses CPU+GPU split after teardown
 DEEP_REVIEW_TIMEOUT = 600              # 10 min — CPU+GPU split is slower
 
 # ── OCR ─────────────────────────────────────────────────────────────────────
-OCR_LANG                = "eng" # Tesseract language code (D22)
+OCR_LANG                = "eng"       # Tesseract language code (D22)
+OCR_PRIMARY             = "surya"     # D30 — primary OCR engine for scanned pages
+OCR_FALLBACK            = "tesseract" # D30 — fallback when surya is unavailable or GPU is absent

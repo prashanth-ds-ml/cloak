@@ -188,11 +188,11 @@ def run_startup_cleanup() -> None:
         names = ", ".join(loaded)
         console.print(f"[dim]Released: {names}  →  freed {freed_str}[/dim]")
 
-    # Show top memory users when vision VRAM headroom is tight
+    # Show top memory users only when total memory is genuinely insufficient
     free_vram = get_free_vram_gb()
     free_ram  = get_free_ram_gb()
     vision_vram_needed = _MODEL_VRAM_GB.get(VISION_PRIMARY, 7.3)
-    if free_vram < vision_vram_needed and free_ram < MIN_FREE_RAM_GB:
+    if (free_vram + free_ram) < vision_vram_needed:
         procs = get_top_processes()
         if procs:
             console.print(
@@ -209,43 +209,46 @@ def run_startup_cleanup() -> None:
 
 def check_model_suitability(model: str, free_ram_gb: float, free_vram_gb: float = 0.0) -> dict:
     """
-    VRAM-aware suitability check. Priority order:
-      1. GPU  — model fits fully in VRAM           → ready (GPU)
-      2. CPU+GPU split — VRAM + RAM covers model   → ready (CPU+GPU)
-      3. CPU  — no GPU but RAM is sufficient       → ready (CPU)
+    Total-memory suitability check. Ollama auto-splits across GPU + CPU RAM,
+    so we use the combined pool to determine viability. Priority order:
+      1. GPU        — fits fully in VRAM
+      2. auto-split — VRAM + RAM covers model (Ollama handles the split)
+      3. CPU        — no GPU, RAM sufficient
       4. marginal / unavailable
     """
     ram_needed  = _MODEL_RAM_GB.get(model, 5.0)
     vram_needed = _MODEL_VRAM_GB.get(model, 5.0)
+    total_free  = free_vram_gb + free_ram_gb
 
     if free_vram_gb >= vram_needed:
         status, backend = "ready", "GPU"
         note = f"{free_vram_gb:.1f} GB VRAM free"
-    elif free_vram_gb >= vram_needed * 0.85:
-        status, backend = "marginal", "GPU"
-        note = f"need {vram_needed:.1f} GB, have {free_vram_gb:.1f} GB"
-    elif free_vram_gb > 0 and (free_vram_gb + free_ram_gb) >= vram_needed:
-        status, backend = "ready", "CPU+GPU"
-        note = f"{free_vram_gb:.1f} GB VRAM + {free_ram_gb:.1f} GB RAM"
+
+    elif free_vram_gb > 0 and total_free >= vram_needed:
+        # Ollama will place as many layers as possible on GPU, remainder on RAM
+        status, backend = "ready", "auto-split"
+        gpu_pct   = min(99, int(free_vram_gb / vram_needed * 100))
+        split_ram = round(vram_needed - free_vram_gb, 1)
+        note = f"{free_vram_gb:.1f} GB GPU + {split_ram} GB RAM  ({gpu_pct}% GPU)"
+
     elif free_ram_gb >= ram_needed:
         status, backend = "ready", "CPU"
         note = f"{free_ram_gb:.1f} GB RAM free"
-    elif free_ram_gb >= ram_needed * 0.85:
-        status, backend = "marginal", "CPU"
-        note = f"need {ram_needed:.1f} GB, have {free_ram_gb:.1f} GB RAM"
+
+    elif total_free >= vram_needed * 0.85:
+        status, backend = "marginal", "CPU+GPU"
+        note = f"need {vram_needed:.1f} GB, have {total_free:.1f} GB total"
+
     else:
         status, backend = "unavailable", ""
-        if free_vram_gb > 0:
-            note = f"need {vram_needed:.1f} GB VRAM, have {free_vram_gb:.1f} GB"
-        else:
-            note = f"need {ram_needed:.1f} GB RAM, have {free_ram_gb:.1f} GB"
+        note = f"need {vram_needed:.1f} GB, have {total_free:.1f} GB total"
 
     return {
         "model":             model,
         "status":            status,
         "backend":           backend,
         "note":              note,
-        "reason":            note,   # backward-compat alias
+        "reason":            note,
         "required_vram_gb":  vram_needed,
         "required_ram_gb":   ram_needed,
     }
@@ -287,11 +290,14 @@ def show_startup_screen(show_commands: bool = False) -> None:
 
     # ── banner ────────────────────────────────────────────────────────────────
     _ASCII = (
-        "[bold cyan]   ___  _    ___   ___  _  __[/bold cyan]\n"
-        "[bold cyan]  / __|| |  / _ \\ / __|| |/ /[/bold cyan]\n"
-        "[bold cyan] | (__ | |_| (_) | (__ | ' < [/bold cyan]\n"
-        "[bold cyan]  \\___||____\\___/ \\___||_|\\_\\[/bold cyan]\n"
-        "  [dim]PDF → Markdown  ·  local-only[/dim]"
+        "  [bold cyan]◆[/bold cyan] [dim]Ollama Powered  ·  PDF → Markdown  ·  Local-only[/dim]\n"
+        "\n"
+        "[bold cyan] ██████╗██╗      ██████╗  █████╗ ██╗  ██╗[/bold cyan]\n"
+        "[bold cyan]██╔════╝██║     ██╔═══██╗██╔══██╗██║ ██╔╝[/bold cyan]\n"
+        "[bold cyan]██║     ██║     ██║   ██║███████║█████╔╝ [/bold cyan]\n"
+        "[bold cyan]██║     ██║     ██║   ██║██╔══██║██╔═██╗ [/bold cyan]\n"
+        "[bold cyan]╚██████╗███████╗╚██████╔╝██║  ██║██║  ██╗[/bold cyan]\n"
+        "[bold cyan] ╚═════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝[/bold cyan]"
     )
     console.print(Panel.fit(_ASCII, border_style="cyan"))
 
@@ -338,7 +344,12 @@ def show_startup_screen(show_commands: bool = False) -> None:
             icon       = "[yellow]![/yellow]"
             status_str = f"[yellow]not pulled[/yellow]  [dim]ollama pull {model}[/dim]"
         elif status == "ready":
-            color      = "green" if backend in ("GPU", "CPU+GPU") else "yellow"
+            if backend == "GPU":
+                color = "green"
+            elif backend == "auto-split":
+                color = "cyan"    # mostly GPU, tiny RAM spill — still fast
+            else:
+                color = "yellow"  # CPU only
             label      = f"ready ({backend})" if backend else "ready"
             icon       = f"[{color}]✓[/{color}]"
             status_str = f"[{color}]{label}[/{color}]  [dim]{note}[/dim]"

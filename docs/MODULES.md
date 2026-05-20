@@ -7,7 +7,7 @@ updated: 2026-05-16 (Session 8)
 
 > Related: [[docs/ARCHITECTURE.md]] · [[docs/MODELS.md]] · [[docs/DECISIONS.md]] · [[docs/PROGRESS.md]]
 
-**All 11 modules done.** `pdf_tools`, `vision_tools`, `quality_judge`, `model_router`, `context_manager`, `parser_agent`, `page_profiler`, `ocr_tools`, `system_check`, `cli/main.py`, `deep_review`.
+**11 modules done, 4 need updates, 1 planned.** New work from Session 9: `doc_profiler` (planned), `page_profiler` (needs DocProfile integration), `ocr_tools` (needs Surya), `model_router` (needs ParsePlan routing), `quality_judge` (needs structural fidelity).
 **Legacy files** (`pdf_extractor.py`, `pdf_classifier.py`, `vision.py`, `markdown_builder.py`): read-only, stay in `ingestion/`.
 
 ---
@@ -70,9 +70,9 @@ If model returns non-JSON, strips markdown fences and retries `json.loads`. On f
 
 ---
 
-## 3 · quality/quality_judge.py ✅ done — PageScore needs per-page update
+## 3 · quality/quality_judge.py ✅ done — needs structural fidelity scoring (D31)
 
-**Purpose:** Typed scoring layer on top of `vision_tools.judge_quality()`.
+**Purpose:** Typed scoring layer on top of `vision_tools.judge_quality()`. Combined score = 0.7 × content_score + 0.3 × structure_score (D31).
 
 ### Key functions
 ```python
@@ -256,9 +256,65 @@ Falls back to `data/markdown/{stem}.md` if no `raw/` directory in path.
 
 ---
 
-## 7 · profiling/page_profiler.py ✅ done
+## 12 · profiling/doc_profiler.py 🔲 planned (D28)
 
-**Purpose:** Classify each PDF page heuristically (zero models) and produce a RouteMap that drives extraction strategy selection in Phase 3. See [[docs/DECISIONS.md]] §D21.
+**Purpose:** Aggregate page profiles into a document-level `DocProfile` and generate a `ParsePlan` — the agent's contract for adaptive round budget, model tier, and judge sampling rate. Runs after page_profiler, before any model load.
+
+### Key functions
+```python
+build_doc_profile(page_profiles: list[PageProfile]) -> DocProfile
+build_parse_plan(doc_profile: DocProfile, primary_viable: bool, use_docling: bool) -> ParsePlan
+```
+
+### DocProfile
+```python
+@dataclass
+class DocProfile:
+    page_count:         int
+    type_distribution:  dict[str, float]  # fraction per page type
+    vision_dependency:  str               # "none" | "low" | "medium" | "high"
+    complexity_score:   float             # 0.0–1.0
+    size_tier:          str               # "small"(<50) | "medium"(50–200) | "large"(200–500) | "huge"(>500)
+```
+
+**vision_dependency thresholds:**
+- `none`   — < 5% image_heavy + mixed + scanned
+- `low`    — 5–20%
+- `medium` — 20–50%
+- `high`   — > 50%
+
+**complexity_score** = weighted sum: scanned×0.4 + image_heavy×0.3 + mixed×0.2 + table_heavy×0.1
+
+### ParsePlan
+```python
+@dataclass
+class ParsePlan:
+    model_tier:         str    # "none" | "fallback" | "primary"
+    max_rounds:         int    # base from size_tier ± complexity adjustment
+    judge_sample_rate:  float  # 1.0 / 0.6 / 0.3 / 0.1 by size tier
+    use_docling:        bool   # True when docling installed and importable
+```
+
+**Adaptive round budget:**
+| size_tier | base rounds | judge_sample_rate |
+|---|---|---|
+| small | 4 | 1.0 |
+| medium | 3 | 0.6 |
+| large | 2 | 0.3 |
+| huge | 1 | 0.1 |
+
+complexity_score > 0.6 → +1 round; < 0.3 → −1 round (min 1).
+
+### Dependencies
+- `profiling/page_profiler.py` — consumes `list[PageProfile]`
+- `cloak.cli.system_check` — reads free VRAM/RAM for model_tier decision
+- No model calls — pure computation
+
+---
+
+## 7 · profiling/page_profiler.py ✅ done — needs DocProfile integration
+
+**Purpose:** Classify each PDF page heuristically (zero models) and produce a RouteMap. When docling is installed, classification is driven by docling's element map instead of heuristics. See [[docs/DECISIONS.md]] §D21 §D29.
 
 ### Key functions
 ```python
@@ -303,9 +359,9 @@ RouteMap = dict[int, str]  # {page_num: page_type}
 
 ---
 
-## 8 · extraction/ocr_tools.py ✅ done
+## 8 · extraction/ocr_tools.py ✅ done — needs Surya upgrade (D30)
 
-**Purpose:** Tesseract OCR wrapper for scanned pages. Called by `parser_agent` for pages where `RouteMap[page_num] == "scanned"`. See [[docs/DECISIONS.md]] §D22.
+**Purpose:** OCR for scanned pages. Primary: Surya (GPU-accelerated, reading-order-aware). Fallback: Tesseract. Called by `parser_agent` for pages where `RouteMap[page_num] == "scanned"`. See [[docs/DECISIONS.md]] §D22 §D30.
 
 ### Key functions
 ```python

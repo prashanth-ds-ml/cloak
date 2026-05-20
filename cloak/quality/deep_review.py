@@ -68,6 +68,13 @@ Numbered list, most impactful first, max 6 items.
 Each item: one sentence — what to fix and where."""
 
 
+def parse_review_score(text: str) -> float | None:
+    """Extract 'Score: X/10' from gemma4 review output. Returns None if not found."""
+    import re
+    m = re.search(r"Score:\s*(\d+(?:\.\d+)?)\s*/\s*10", text)
+    return float(m.group(1)) if m else None
+
+
 def _is_model_installed(model: str) -> bool:
     """Check if the model is available in Ollama without loading it."""
     try:
@@ -141,7 +148,7 @@ def run(
     final_markdown: str,
     review_out: Path,
     console,
-) -> Path | None:
+) -> tuple[Path | None, float | None]:
     """
     Run deep quality review and write {stem}_review.md.
     Returns the path written, or None if the review failed.
@@ -160,13 +167,14 @@ def run(
             f"  [yellow]Deep review skipped — {DEEP_REVIEW_MODEL} not installed.[/yellow]\n"
             f"  [dim]Install with: ollama pull {DEEP_REVIEW_MODEL}[/dim]"
         )
-        return None
+        return None, None
 
     try:
         body = _call(raw_text, final_markdown)
+        score = parse_review_score(body)
     except Exception as exc:
         console.print(f"  [red]Deep review failed: {exc}[/red]")
-        return None
+        return None, None
     finally:
         _unload()
 
@@ -179,4 +187,4 @@ def run(
     )
 
     review_out.write_text(report, encoding="utf-8")
-    return review_out
+    return review_out, score

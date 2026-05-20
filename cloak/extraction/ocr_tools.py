@@ -1,34 +1,40 @@
 """
-ocr_tools.py — Tesseract OCR wrapper for scanned pages.
-Called by parser_agent for pages where RouteMap[page_num] == "scanned".
-See DECISIONS.md §D22.
+ocr_tools.py — OCR for scanned pages. Surya primary, Tesseract fallback (D30).
 
-Requires the Tesseract binary to be installed separately:
+Fallback chain for scanned pages:
+  surya OCR (GPU-accelerated, reading-order-aware) → D30
+  tesseract (CPU fallback)                         → D22
+  raw PyMuPDF text blocks (last resort)            → caller handles
+
+Tesseract requires the binary:
   Windows : winget install UB-Mannheim.TesseractOCR
-             (or download from https://github.com/UB-Mannheim/tesseract/wiki)
   Linux   : sudo apt install tesseract-ocr
   macOS   : brew install tesseract
 
-If the binary is missing, ocr_page() raises OCRError and the caller
-falls back to raw PyMuPDF text blocks — no crash, just lower quality.
+Surya models are downloaded from HuggingFace on first use and cached locally.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageFilter
 
 from cloak.config import OCR_LANG
 
-_MIN_OCR_PX = 2000       # upscale long edge to this before OCR — better accuracy
-_TESSERACT_CONFIG = "--oem 3 --psm 3"   # LSTM engine, fully automatic page segmentation
+_MIN_OCR_PX       = 2000            # upscale long edge before Tesseract — better accuracy
+_TESSERACT_CONFIG = "--oem 3 --psm 3"  # LSTM engine, fully automatic page segmentation
 
 # Windows default install paths to check when Tesseract is not on PATH
 _WIN_TESSERACT_PATHS = [
     Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
     Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
 ]
+
+# Lazy-loaded surya predictor singletons (avoid reloading models per page)
+_surya_rec: Any = None
+_surya_det: Any = None
 
 
 class OCRError(Exception):
@@ -110,26 +116,76 @@ def clean_ocr_text(raw: str) -> str:
     return text.strip()
 
 
+# ── Surya OCR ─────────────────────────────────────────────────────────────────
+
+def _load_surya() -> tuple[Any, Any]:
+    """Lazy-load surya recognition + detection predictors. Cached after first load."""
+    global _surya_rec, _surya_det
+    if _surya_rec is None or _surya_det is None:
+        try:
+            from surya.recognition import RecognitionPredictor
+            from surya.detection import DetectionPredictor
+            _surya_rec = RecognitionPredictor()
+            _surya_det = DetectionPredictor()
+        except Exception as exc:
+            raise OCRError(f"Surya model load failed: {exc}") from exc
+    return _surya_rec, _surya_det
+
+
+def _ocr_page_surya(image: Image.Image) -> str:
+    """
+    Run Surya OCR on a page image. Preserves reading order (sort_lines=True).
+    Returns cleaned text. Raises OCRError on any failure.
+    """
+    try:
+        rec, det = _load_surya()
+        results  = rec([image], det_predictor=det, sort_lines=True)
+        lines    = results[0].text_lines
+        text     = "\n".join(ln.text for ln in lines if ln.text.strip())
+        return clean_ocr_text(text)
+    except OCRError:
+        raise
+    except Exception as exc:
+        raise OCRError(f"Surya OCR failed: {exc}") from exc
+
+
+def is_surya_available() -> bool:
+    """Return True if surya is installed (GPU not required for the check itself)."""
+    try:
+        import surya.recognition  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def ocr_page(image: Image.Image, lang: str = OCR_LANG) -> str:
     """
-    Run Tesseract OCR on a page image. Returns cleaned text string.
+    OCR a scanned page image. Tries Surya first (D30), falls back to Tesseract.
 
-    Raises OCRError if:
-      - pytesseract is not installed
-      - Tesseract binary is not found
-      - Tesseract call fails for any reason
-
+    Raises OCRError only when both engines fail.
     Callers should catch OCRError and fall back to raw PyMuPDF text.
     """
+    # Try Surya primary (D30)
+    if is_surya_available():
+        try:
+            return _ocr_page_surya(image)
+        except OCRError:
+            pass  # fall through to Tesseract
+
+    # Tesseract fallback (D22)
+    return _ocr_page_tesseract(image, lang)
+
+
+def _ocr_page_tesseract(image: Image.Image, lang: str = OCR_LANG) -> str:
+    """Run Tesseract OCR. Raises OCRError on any failure."""
     try:
         import pytesseract
     except ImportError:
         raise OCRError("pytesseract not installed — run: pip install pytesseract")
 
     _configure_tesseract()
-
     preprocessed = _preprocess(image)
 
     try:
@@ -147,7 +203,12 @@ def ocr_page(image: Image.Image, lang: str = OCR_LANG) -> str:
 
 
 def is_available() -> bool:
-    """Return True if Tesseract is installed and callable. Safe to call anytime."""
+    """Return True if at least one OCR engine (Surya or Tesseract) is ready."""
+    return is_surya_available() or _is_tesseract_available()
+
+
+def _is_tesseract_available() -> bool:
+    """Return True if Tesseract is installed and callable."""
     try:
         import pytesseract
         import shutil

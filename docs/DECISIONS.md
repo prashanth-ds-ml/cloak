@@ -1,6 +1,6 @@
 ---
 type: decision-log
-updated: 2026-05-16 (Session 8)
+updated: 2026-05-20 (Session 11)
 ---
 
 # Decision Log — cloak
@@ -127,11 +127,13 @@ Why things are the way they are. Read before changing any design parameter.
 
 **Original decision (Session 3):** `MODEL_KEEP_ALIVE = 600` — keep models warm for 600s between rounds to avoid cold reloads.
 
-**Updated (Session 7):** `MODEL_KEEP_ALIVE = 0` — explicit phase-based management via `model_router` handles lifecycle. `before_vision_phase()` and `before_orchestrator_phase()` unload models at phase boundaries. `teardown_pdf()` cleans up at end of PDF.
+**Updated (Session 7):** `MODEL_KEEP_ALIVE = 0` — explicit phase-based management via `model_router` handles lifecycle.
 
-**Rationale for change:** With phase-based unloads, keep_alive warmth is no longer needed to prevent mid-parse ejections. Setting 0 allows Ollama to reclaim memory immediately after each call rather than holding it for 10 minutes.
+**Updated (Session 11):** `MODEL_KEEP_ALIVE = -1` — model stays loaded indefinitely until an explicit unload call. Phase boundaries (`before_vision_phase` / `before_orchestrator_phase`) always fire and always unload the inactive model before the active phase starts.
 
-**Known trade-off:** `keep_alive=0` causes the model to unload after **every** `ollama.chat()` call, including within the Phase 5 judge loop (multiple pages). For a 10-page document this means up to 10 cold reloads per judge round. If parse speed is poor, consider raising to `3600` (1 hour) which keeps the model warm within a phase while still allowing explicit unloads via `model_router.unload()` to work normally between phases.
+**Rationale for -1:** `keep_alive=0` unloads the model after every `ollama.chat()` call — including within the Phase 5 judge loop. For a 10-page document this means up to 10 cold reloads per judge round, each taking ~5–10s on a warm GPU. With `-1`, the model stays loaded across all calls within a phase. Explicit phase-boundary unloads (`before_vision_phase` / `before_orchestrator_phase`) still fire to free memory for the next phase. Net effect: zero cold reloads within a phase, predictable memory handoff between phases.
+
+**Unload mechanism:** Ollama accepts `keep_alive=0` in a `/api/generate` POST to forcibly unload regardless of the session keep_alive. `model_router.unload()` uses this for all phase-boundary unloads.
 
 **Adjust in:** `config.MODEL_KEEP_ALIVE`
 
@@ -157,7 +159,9 @@ Why things are the way they are. Read before changing any design parameter.
 
 **Why:** The previous approach switched models reactively per-page. Predictable phase boundaries eliminate hidden latency and make VRAM state auditable at every point in the loop.
 
-**Session 8 update:** With `qwen3-vl:4b` as `VISION_FALLBACK` (3.3 GB), both vision models coexist freely with `qwen3:8b`. `before_vision_phase()` and `before_orchestrator_phase()` are now no-ops for both fallback scenarios — they exist to enforce the rule structurally, not because any model pair actually conflicts.
+**Session 8 update:** With `qwen3-vl:4b` as `VISION_FALLBACK` (3.3 GB), both vision models fit alongside `qwen3:8b` within the 8 GB VRAM pool.
+
+**Session 11 update:** Phase boundaries are now always-fire unconditional unloads. `before_vision_phase()` always unloads the orchestrator; `before_orchestrator_phase()` always unloads the vision model — even when the model pair would technically coexist. This maximises available memory for the active model's auto-split (D32). The sticky vision model is preserved across the orchestrator phase so the next vision phase resumes without re-probing.
 
 **See:** [[ARCHITECTURE.md]] §Phase-based model routing · [[MODELS.md]] §VRAM rules · [[MODULES.md]] §model_router
 
@@ -233,11 +237,11 @@ The startup display is built from `GET /api/tags` (installed models) + `psutil` 
 | `qwen3:8b` | ~5.2 GB | 5.5 GB | Orchestrator |
 | `qwen3-vl:4b` | ~3.5 GB | 4.5 GB | Vision fallback |
 
-**Suitability priority (VRAM-aware):**
+**Suitability priority (total-memory-aware, Session 11):**
 1. GPU — model fits fully in VRAM → `ready (GPU)`
-2. CPU+GPU — VRAM + RAM together cover model → `ready (CPU+GPU)`
-3. CPU — no GPU but RAM sufficient → `ready (CPU)`
-4. Marginal (≥ 85% of needed) or unavailable
+2. auto-split — any VRAM present and (VRAM + RAM) ≥ model weight → `ready (auto-split)` — Ollama handles the GPU/RAM split automatically
+3. CPU — no GPU but RAM ≥ RAM requirement → `ready (CPU)`
+4. unavailable — total memory < model weight
 
 **See:** [[MODULES.md]] §system_check · [[MODELS.md]] §Model suitability table
 
@@ -425,6 +429,205 @@ DEEP_REVIEW_TIMEOUT = 600              # 10 min — CPU+GPU split is slower
 **Implementation:** `cloak/quality/deep_review.py` — `run(pdf_path, pages, final_markdown, review_out, console) -> Path | None`. Always calls `_unload()` in finally block regardless of success.
 
 **See:** [[docs/MODULES.md]] §11 · [[ARCHITECTURE.md]] §Full pipeline
+
+---
+
+## D28 — Two-level profiler: DocProfile + ParsePlan
+
+**Decision:** Before loading any model, run two profiling steps:
+1. **Page-level** (extends D21) — heuristic or docling element map per page
+2. **Document-level** — aggregate page profiles into a `DocProfile`; use it to generate a `ParsePlan`
+
+**DocProfile fields:**
+```python
+@dataclass
+class DocProfile:
+    page_count:         int
+    type_distribution:  dict[str, float]   # {"text_rich": 0.82, "image_heavy": 0.12, ...}
+    vision_dependency:  str                # "none" | "low" | "medium" | "high"
+    complexity_score:   float              # 0.0–1.0; drives round budget
+    size_tier:          str                # "small" | "medium" | "large" | "huge"
+```
+
+**ParsePlan fields:**
+```python
+@dataclass
+class ParsePlan:
+    model_tier:         str                # "none" | "fallback" | "primary"
+    max_rounds:         int                # adaptive — see table below
+    judge_sample_rate:  float              # fraction of pages to judge per round
+    use_docling:        bool               # True when docling is installed
+```
+
+**Adaptive round budget (from size_tier + complexity_score):**
+
+| Size tier | Pages | Base rounds | Judge sample |
+|---|---|---|---|
+| small | < 50 | 4 | 100% |
+| medium | 50–200 | 3 | 60% |
+| large | 200–500 | 2 | 30% |
+| huge | > 500 | 1 | 10% |
+
+Complexity adds/subtracts: `complexity_score > 0.6` → +1 round; `< 0.3` → −1 round (min 1).
+
+**Vision dependency routing:**
+- `none` (< 5% image/mixed/scanned) → skip vision probe entirely; pdfplumber + docling only
+- `low` (5–20%) → load `VISION_FALLBACK` only
+- `medium` (20–50%) → try `VISION_PRIMARY`, fallback to `VISION_FALLBACK`
+- `high` (> 50%) → always try `VISION_PRIMARY` first
+
+**Why:** The probe runs 30s per PDF even when 95% of pages are clean text. DocProfile computed at zero model cost eliminates blind model loading decisions. ParsePlan is the agent's contract with itself — all downstream phases execute the plan, not fixed constants.
+
+**See:** D21 (page profiler) · D29 (docling) · [[MODULES.md]] §page_profiler
+
+---
+
+## D29 — Docling as structural extraction foundation
+
+**Decision:** Docling runs as a layout analysis pass in Phase 1, before any model is loaded. It produces a structured element map per page that drives all extraction decisions.
+
+**What docling classifies (per page):**
+```
+SectionHeaderItem (level=1,2,3)  →  ## / ### / #### headings
+TextItem                          →  body paragraph
+TableItem (with cell structure)   →  markdown table
+FigureItem (with caption)         →  figure bbox + caption text
+ListItem                          →  bullet or numbered item
+FootnoteItem                      →  collected, appended at section end
+FormulaItem                       →  equation (described by vision or LaTeX)
+PageHeader / PageFooter           →  DISCARDED — never pollutes content
+```
+
+Reading order across columns is reconstructed by docling's layout model (trained on DocLayNet, 80K+ diverse document pages). This is more reliable than our current spatial_sort heuristic.
+
+**What this changes in the pipeline:**
+- Headings are extracted at the correct H1/H2/H3 level — no more font-size guessing
+- Page headers/footers are excluded — no more "Chapter 3" repeated 40 times in output
+- Footnotes are collected and linked — not orphaned in body text
+- Multi-column reading order is correct from day one
+- FORMAT step becomes light cleanup only — structure is already correct from docling
+
+**Vision model's new focused role** (narrowed from current):
+- Figure/diagram description (`region_describe`) — docling finds the bbox; vision describes it
+- Quality judging (`judge_quality`) — comparing markdown vs source image
+- Patches for complex visual content that docling + pdfplumber miss
+- Vision is NOT called for heading extraction, text layout, or column ordering on text_rich pages
+
+**Fallback when docling not installed:**
+- Phase 1 reverts to D21 heuristic page_profiler
+- Extraction falls back to current vision-for-all-pages approach (D23)
+- Docling status shown at `cloak status` / `cloak doctor` (planned)
+
+**Why:** The core data-loss problems (wrong reading order, lost headings, page header pollution, orphaned footnotes) are all structural problems. No amount of judge→patch rounds recovers wrong reading order — the structural information must be captured at extraction time.
+
+**Dependency:** `pip install docling` — downloads 258 MB layout model on first run, cached afterward.
+
+**See:** D21 · D28 · [[MODULES.md]] §page_profiler · [[MODULES.md]] §extraction
+
+---
+
+## D30 — Surya as primary OCR for scanned pages
+
+**Decision:** Replace Tesseract as the primary OCR engine for scanned pages with Surya. Tesseract kept as fallback.
+
+**Why Surya over Tesseract:**
+- Surya detects reading order and layout in addition to recognising characters — critical for scanned multi-column documents
+- 90+ language support without separate language pack installation
+- Better accuracy on low-contrast, mildly rotated, and mixed-font scans
+- GPU-accelerated on RTX 5050 — fast in practice
+
+**Fallback chain for scanned pages:**
+```
+surya OCR → tesseract fallback → raw PyMuPDF text blocks (last resort)
+```
+
+**CPU note:** Surya requires GPU for acceptable speed. On CPU it is slower than Tesseract. On RTX 5050 (8 GB VRAM) it runs fast. The ParsePlan (D28) accounts for this: pages classified `scanned` in the DocProfile flag `use_surya = True` only when GPU is available.
+
+**Config:**
+```python
+OCR_PRIMARY  = "surya"      # preferred OCR engine
+OCR_FALLBACK = "tesseract"  # fallback if surya not installed or GPU unavailable
+```
+
+**See:** D22 (Tesseract decision) · [[MODULES.md]] §ocr_tools
+
+---
+
+## D31 — Markdown output standard and structural fidelity scoring
+
+**Decision:** Define a concrete markdown output standard that all extraction, FORMAT, and patch steps must preserve. Add structural fidelity as a second scoring axis alongside content completeness.
+
+**Markdown output standard:**
+```markdown
+# Document Title
+
+## 1. Section Heading
+
+Body text with correct reading order. Multi-column text flows
+correctly — no mid-sentence breaks.
+
+### 1.1 Sub-section
+
+> **Table 1: Caption**
+| Col A | Col B |
+|-------|-------|
+| val   | val   |
+
+![Figure 1](stem_images/figure_1.png)
+*Figure 1: Caption text extracted from document*
+
+---
+**Footnotes**
+[^1]: Full footnote text linked to its reference
+```
+
+**Structural fidelity signals (added to judge scoring):**
+- Headings present and at correct hierarchy levels (H1 > H2 > H3)
+- Tables complete — all rows, all columns, header row present
+- Figure captions attached to the correct figure
+- Footnotes present and linked (not orphaned)
+- No page header/footer text polluting body content
+
+**Combined quality score:**
+```
+content_score     = judge completeness vs source image  (existing)
+structure_score   = structural fidelity signals above   (new)
+final_score       = 0.7 * content_score + 0.3 * structure_score
+```
+
+**Why:** A page can score 9/10 on content completeness but be unreadable because headings are missing or reading order is broken. The current judge only sees content gaps. Structural fidelity makes quality scoring honest.
+
+**See:** D24 (confidence report) · D29 (docling structure) · [[MODULES.md]] §quality_judge
+
+---
+
+## D32 — Total-memory model routing (VRAM + RAM pool)
+
+**Decision (Session 11):** Model viability is determined by `total_free = free_vram + free_ram`, not VRAM alone. A model is viable when `total_free >= model_weight_gb`. Ollama automatically places as many layers as possible on GPU and spills the remainder to CPU RAM (auto-split) — no code change needed.
+
+**Why:** With 8 GB VRAM and 24 GB RAM, `qwen2.5vl:7b` (7.3 GB) requires only ~0.3 GB from RAM when ~7.0 GB VRAM is free. The old VRAM-only check was incorrectly routing to the 4b fallback when qwen2.5vl:7b would have loaded fine via Ollama's auto-split. The new check correctly classifies this as `ready (auto-split)`.
+
+**Hardware tiers served:**
+- Entry (16 GB RAM / 6 GB VRAM): total ~22 GB — covers all three pipeline models
+- Mid (24 GB RAM / 8 GB VRAM): total ~32 GB — primary model fully in VRAM
+- High (32 GB RAM / 12+ GB VRAM): total ~44 GB — gemma4 may also fit entirely in VRAM
+
+**Model weights used:**
+```python
+_MODEL_SIZE_GB = {
+    VISION_PRIMARY:     7.3,   # qwen2.5vl:7b
+    VISION_FALLBACK:    3.5,   # qwen3-vl:4b
+    ORCHESTRATOR_MODEL: 5.2,   # qwen3:8b
+}
+```
+
+**What changed in code (Session 11):**
+- `model_router.py`: replaced `_VISION_PRIMARY_VRAM_GB` with `_MODEL_SIZE_GB` dict; `vision_models_to_try()` uses `free_vram + free_ram >= model_weight`
+- `system_check.py`: `check_model_suitability()` now shows `ready (auto-split)` for models that span GPU+RAM; removed 85% marginal band; `run_startup_cleanup()` warning threshold uses total memory
+- `profiling/doc_profiler.py`: `build_parse_plan()` param renamed `gpu_available` → `primary_viable`; viability = total memory check, not GPU-only
+- `orchestration/parser_agent.py`: `_gpu_est` uses `(free_vram + free_ram) >= primary_model_size`
+
+**See:** D11 (keep_alive -1) · D14 (phase boundaries) · [[MODELS.md]] §Model suitability table
 
 ---
 

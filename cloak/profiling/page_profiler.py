@@ -112,3 +112,17 @@ def summarise(profiles: list[PageProfile]) -> dict[str, int]:
     for p in profiles:
         counts[p.page_type] = counts.get(p.page_type, 0) + 1
     return counts
+
+
+def update_vision_from_docling(
+    profiles: list[PageProfile],
+    element_map: dict[int, list],   # DoclingPageMap — typed as dict to avoid circular import
+) -> None:
+    """
+    Refine needs_vision for each page based on the docling element map (D29).
+    After this call, needs_vision=True only for pages that have actual PictureItems.
+    Vision is no longer called for heading extraction or text layout on text_rich pages.
+    """
+    for p in profiles:
+        elements = element_map.get(p.page_num, [])
+        p.needs_vision = any(getattr(el, "label", None) == "picture" for el in elements)

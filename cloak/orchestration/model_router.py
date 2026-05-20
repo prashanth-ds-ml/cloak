@@ -1,22 +1,30 @@
 """
-model_router.py — phase-based sequential model routing for 8 GB GPU.
+model_router.py — phase-based sequential model routing.
+
+Ollama auto-splits any model across GPU + CPU RAM when VRAM is insufficient.
+We use total available memory (VRAM + RAM) to decide model viability — never
+reject a model purely because it doesn't fit in GPU alone.
 
 Two hard phases per round (D14):
-  VISION PHASE       — extract + judge  (qwen2.5vl:7b or llama3.2-vision:11b)
-  ORCHESTRATOR PHASE — patch loop       (qwen3:8b)
+  VISION PHASE       — extract + judge  (qwen2.5vl:7b or qwen3-vl:4b)
+  ORCHESTRATOR PHASE — format + patch   (qwen3:8b)
 
-Phase boundaries are called explicitly by parser_agent via:
-  before_vision_phase()       — unloads qwen3:8b when llama3.2-vision is sticky
-  before_orchestrator_phase() — unloads llama3.2-vision when it was sticky
+Phase boundaries unload the inactive model so the active one has maximum
+memory for its auto-split. With MODEL_KEEP_ALIVE=-1 models stay warm within
+a phase; explicit unload at the boundary frees memory for the next phase.
 
-GPU/CPU routing: Ollama auto-selects GPU when VRAM is sufficient and splits
-layers to CPU+RAM when it isn't. num_gpu=-1 (the default) enables this.
-qwen2.5vl:7b + qwen3:8b can coexist on 24 GB RAM (~10 GB total, GPU+RAM spill).
-llama3.2-vision:11b (11 GB) cannot coexist with qwen3:8b — enforced by D7.
+ParsePlan routing (D28):
+  set_parse_plan(plan) — called after Phase 1; vision_models_to_try() uses
+  plan.model_tier to skip the probe entirely ("none"), use fallback only
+  ("fallback"), or full primary→fallback chain ("primary").
 """
 from __future__ import annotations
 
+import subprocess
+from typing import TYPE_CHECKING, Any
+
 import httpx
+import psutil
 
 from cloak.config import (
     OLLAMA_BASE_URL,
@@ -24,6 +32,9 @@ from cloak.config import (
     VISION_FALLBACK,
     VISION_PRIMARY,
 )
+
+if TYPE_CHECKING:
+    from cloak.profiling.doc_profiler import ParsePlan
 
 
 # ── Ollama management ─────────────────────────────────────────────────────────
@@ -52,15 +63,23 @@ def unload(model: str) -> None:
 
 # ── Sticky model per PDF ──────────────────────────────────────────────────────
 
-_sticky_vision: str | None = None
-_using_fallback: bool = False
+_sticky_vision:  str | None = None
+_using_fallback: bool       = False
+_current_plan:   Any        = None   # ParsePlan | None — set by set_parse_plan()
 
 
 def reset() -> None:
-    """Call at the start of each PDF to clear sticky model state."""
-    global _sticky_vision, _using_fallback
-    _sticky_vision = None
+    """Call at the start of each PDF to clear sticky model state and ParsePlan."""
+    global _sticky_vision, _using_fallback, _current_plan
+    _sticky_vision  = None
     _using_fallback = False
+    _current_plan   = None
+
+
+def set_parse_plan(plan: ParsePlan) -> None:
+    """Store the ParsePlan for the current PDF. Called during Phase 1 before probe."""
+    global _current_plan
+    _current_plan = plan
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -88,25 +107,21 @@ def switch_to_fallback() -> None:
 
 def before_vision_phase() -> None:
     """
-    Phase boundary: unload qwen3:8b when llama3.2-vision is the sticky model (D7/D14).
-    No-op when qwen2.5vl:7b is sticky — those two coexist safely.
+    Phase boundary: unload orchestrator before vision phase (D14).
+    Frees its GPU layers so vision model gets maximum memory for auto-split.
     """
-    if _sticky_vision == VISION_FALLBACK:
-        if ORCHESTRATOR_MODEL in loaded_models():
-            unload(ORCHESTRATOR_MODEL)
+    if ORCHESTRATOR_MODEL in loaded_models():
+        unload(ORCHESTRATOR_MODEL)
 
 
 def before_orchestrator_phase() -> None:
     """
-    Phase boundary: unload llama3.2-vision before the patch loop (D7/D14).
-    Resets sticky so region_describe calls inside the patch loop use VISION_PRIMARY.
-    No-op when qwen2.5vl:7b is sticky.
+    Phase boundary: unload vision model before orchestrator phase (D14).
+    Frees its GPU layers so qwen3:8b gets maximum memory for auto-split.
+    Sticky model is preserved — remembered for the next vision phase.
     """
-    global _sticky_vision, _using_fallback
-    if _sticky_vision == VISION_FALLBACK:
-        unload(VISION_FALLBACK)
-        _sticky_vision = None
-        _using_fallback = False
+    if _sticky_vision and _sticky_vision in loaded_models():
+        unload(_sticky_vision)
 
 
 def restore_orchestrator() -> None:
@@ -129,14 +144,66 @@ def teardown_pdf() -> None:
     reset()
 
 
-def get_ollama_options(base: dict | None = None) -> dict:
+# Model weight sizes — used for total-memory viability check
+# Ollama auto-splits across GPU+RAM; a model is viable if total >= size
+_MODEL_SIZE_GB: dict[str, float] = {
+    VISION_PRIMARY:     7.3,   # qwen2.5vl:7b
+    VISION_FALLBACK:    3.5,   # qwen3-vl:4b
+    ORCHESTRATOR_MODEL: 5.2,   # qwen3:8b
+}
+
+
+def _free_vram_gb() -> float:
+    """Quick nvidia-smi probe. Returns 0.0 on any failure."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return float(r.stdout.strip().splitlines()[0]) / 1024  # MiB → GB
+    except Exception:
+        pass
+    return 0.0
+
+
+def _free_ram_gb() -> float:
+    """Available system RAM in GB. Returns 0.0 on failure."""
+    try:
+        return psutil.virtual_memory().available / 1e9
+    except Exception:
+        return 0.0
+
+
+def vision_models_to_try() -> list[str]:
     """
-    Return Ollama options dict for model calls.
-    num_gpu=-1 tells Ollama to use all available GPU layers automatically,
-    falling back to a CPU+GPU split when VRAM is insufficient.
-    Merges any caller-supplied base options.
+    Return vision models to probe in quality-first preference order (D28).
+
+    ParsePlan model_tier overrides hardware check:
+      "none"     → [] (no visual content — skip probe entirely)
+      "fallback" → [VISION_FALLBACK]
+      "primary"  → hardware-aware selection below
+
+    Hardware check uses total available memory (VRAM + RAM).
+    Ollama auto-splits any model across GPU and CPU RAM, so a model is
+    viable whenever total_free >= model_weight_gb.
+    Models are ordered primary-first; only included if total memory covers them.
     """
-    opts = {"num_gpu": -1}
-    if base:
-        opts.update(base)
-    return opts
+    if _current_plan is not None:
+        tier = getattr(_current_plan, "model_tier", "primary")
+        if tier == "none":
+            return []
+        if tier == "fallback":
+            return [VISION_FALLBACK]
+
+    free_vram = _free_vram_gb()
+    free_ram  = _free_ram_gb()
+    total     = free_vram + free_ram
+
+    models: list[str] = []
+    for m in (VISION_PRIMARY, VISION_FALLBACK):
+        if total >= _MODEL_SIZE_GB.get(m, 9.9):
+            models.append(m)
+    return models
+
+

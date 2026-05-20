@@ -23,8 +23,8 @@ data/markdown/
 logs/*.log
 !logs/.gitkeep
 
-# CLI config (stores user's project path and settings)
-.cloak.json
+# Workspace registry (local state — not committed)
+.cloak/
 
 # Claude Code local settings (permissions, session state — machine-specific)
 .claude/

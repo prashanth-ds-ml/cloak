@@ -51,7 +51,10 @@ def parse(
     dry_run: bool = typer.Option(False, "--dry-run", help="List PDFs that would be parsed without parsing"),
 ) -> None:
     """Parse a PDF file or all PDFs in a directory."""
+    from cloak.cli import system_check
     from cloak.orchestration.parser_agent import parse as do_parse
+
+    system_check.run_startup_cleanup()
 
     if not path.exists():
         console.print(f"[red]Path not found: {path}[/red]")
@@ -95,7 +98,7 @@ def parse(
 
         file_t0 = time.monotonic()
         try:
-            do_parse(pdf, deep_review=not no_review)
+            do_parse(pdf, deep_review=not no_review, workspace=Path.cwd())
             results.append({
                 "name":    pdf.stem,
                 "elapsed": time.monotonic() - file_t0,
@@ -144,13 +147,20 @@ def status() -> None:
 
 
 def _read_best_score(conf_path: Path) -> str:
-    """Extract the best score from a confidence report, colour-coded."""
+    """Extract judge score from a confidence report, colour-coded."""
     if not conf_path.exists():
         return "[dim]—[/dim]"
     try:
         import re
         text = conf_path.read_text(encoding="utf-8")
-        scores = [float(m) for m in re.findall(r"\|\s*\w+\s*\|\s*([\d.]+)\s*\|", text)]
+        # New format: Summary table with "| Judge Score | X.X / 10 |"
+        m = re.search(r"\|\s*Judge Score\s*\|\s*([\d.]+)\s*/\s*10\s*\|", text)
+        if m:
+            avg = float(m.group(1))
+            color = "green" if avg >= 8.0 else ("yellow" if avg >= 5.0 else "red")
+            return f"[{color}]{avg:.1f}[/{color}]"
+        # Fallback: old format — parse per-page score cells
+        scores = [float(s) for s in re.findall(r"\|\s*\w+\s*\|\s*([\d.]+)\s*\|", text)]
         if not scores:
             return "[dim]—[/dim]"
         avg = sum(scores) / len(scores)
@@ -162,46 +172,97 @@ def _read_best_score(conf_path: Path) -> str:
 
 @app.command("list")
 def list_docs() -> None:
-    """List all parsed documents in data/markdown/."""
-    from cloak.config import MD_DIR
+    """List all tracked documents (registry + parsed output)."""
+    from cloak import registry as _reg_module
     import datetime
 
-    if not MD_DIR.exists():
-        console.print(f"[dim]No output directory at {MD_DIR}[/dim]")
-        raise typer.Exit()
+    reg, ws = _reg_module.load(Path.cwd())
+    docs = _reg_module.all_docs(reg)
 
-    md_files = sorted(
-        (
-            f for f in MD_DIR.rglob("*.md")
-            if not any(f.name.endswith(s) for s in ("_confidence.md", "_review.md"))
-            and ".obsidian" not in f.parts
-        ),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )
+    _STATUS_COLOR = {
+        _reg_module.DONE:       "green",
+        _reg_module.FLAGGED:    "yellow",
+        _reg_module.PENDING:    "dim",
+        _reg_module.PROCESSING: "cyan",
+        _reg_module.ERROR:      "red",
+    }
+    _STATUS_ICON = {
+        _reg_module.DONE:       "✓",
+        _reg_module.FLAGGED:    "⚑",
+        _reg_module.PENDING:    "·",
+        _reg_module.PROCESSING: "⟳",
+        _reg_module.ERROR:      "✗",
+    }
 
-    if not md_files:
-        console.print(f"[dim]No parsed documents in {MD_DIR}[/dim]")
-        raise typer.Exit()
+    if docs:
+        # Sort: errors first (need attention), then flagged, then done, then pending
+        _ORDER = {
+            _reg_module.ERROR:      0,
+            _reg_module.FLAGGED:    1,
+            _reg_module.DONE:       2,
+            _reg_module.PROCESSING: 3,
+            _reg_module.PENDING:    4,
+        }
+        docs.sort(key=lambda d: (
+            _ORDER.get(d.get("status", ""), 5),
+            d.get("last_parsed", "") or "",
+        ), reverse=False)
 
-    tbl = Table(title=f"Parsed documents  ({MD_DIR})", show_header=True, header_style="dim")
-    tbl.add_column("File", style="cyan")
-    tbl.add_column("Size", justify="right")
-    tbl.add_column("Parsed", style="dim")
-    tbl.add_column("Score", justify="right")
-    tbl.add_column("Review", justify="center")
+        tbl = Table(
+            title=f"Documents  ·  {ws}",
+            show_header=True, header_style="dim",
+        )
+        tbl.add_column("",       width=2, no_wrap=True)
+        tbl.add_column("File",   style="cyan", min_width=28)
+        tbl.add_column("Status", min_width=10)
+        tbl.add_column("Score",  justify="right")
+        tbl.add_column("Pages",  justify="right", style="dim")
+        tbl.add_column("Model",  style="dim",     min_width=14, no_wrap=True)
+        tbl.add_column("Parsed", style="dim",     min_width=16)
 
-    for f in md_files:
-        stat = f.stat()
-        size  = f"{stat.st_size // 1024} KB" if stat.st_size >= 1024 else f"{stat.st_size} B"
-        mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-        conf  = f.with_name(f.stem + "_confidence.md")
-        rev   = f.with_name(f.stem + "_review.md")
-        score_str  = _read_best_score(conf)
-        review_str = "[green]✓[/green]" if rev.exists() else "[dim]—[/dim]"
-        tbl.add_row(str(f.relative_to(MD_DIR)), size, mtime, score_str, review_str)
+        for d in docs:
+            status  = d.get("status", "?")
+            color   = _STATUS_COLOR.get(status, "")
+            icon    = _STATUS_ICON.get(status, "?")
+            icon_s  = f"[{color}]{icon}[/{color}]" if color else icon
 
-    console.print(tbl)
+            # Score
+            js = d.get("judge_score")
+            if js is not None:
+                sc = "green" if js >= 8.0 else ("yellow" if js >= 5.0 else "red")
+                score_s = f"[{sc}]{js:.1f}[/{sc}]"
+            elif status == _reg_module.PENDING:
+                score_s = "[dim]—[/dim]"
+            else:
+                score_s = "[dim]—[/dim]"
+
+            # Flagged pages badge
+            fp = d.get("flagged_pages", 0)
+            name_s = d.get("pdf", "?")
+            if fp:
+                name_s += f"  [yellow dim]({fp} flagged)[/yellow dim]"
+
+            pages_s  = str(d.get("total_pages", "")) or "[dim]—[/dim]"
+            model_s  = d.get("model") or "[dim]—[/dim]"
+            lp       = d.get("last_parsed", "")
+            parsed_s = lp[:16].replace("T", " ") if lp else "[dim]—[/dim]"
+
+            tbl.add_row(icon_s, name_s, f"[{color}]{status}[/{color}]" if color else status,
+                        score_s, pages_s, model_s, parsed_s)
+
+        console.print(tbl)
+
+        # Summary counts
+        counts = {}
+        for d in docs:
+            counts[d.get("status", "?")] = counts.get(d.get("status", "?"), 0) + 1
+        parts = [f"[{_STATUS_COLOR.get(s, '')}]{n} {s}[/{_STATUS_COLOR.get(s, '')}]"
+                 if _STATUS_COLOR.get(s) else f"{n} {s}"
+                 for s, n in sorted(counts.items())]
+        console.print(f"  [dim]{'  ·  '.join(parts)}[/dim]\n")
+
+    else:
+        console.print("[dim]No documents tracked yet. Run[/dim] cloak parse <pdf> [dim]to get started.[/dim]")
 
 
 @app.command()

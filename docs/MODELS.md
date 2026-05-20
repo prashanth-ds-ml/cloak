@@ -1,6 +1,6 @@
 ---
 type: model-reference
-updated: 2026-05-16 (Session 8)
+updated: 2026-05-20 (Session 11)
 ---
 
 # Model Reference — cloak
@@ -23,18 +23,20 @@ All models run locally via Ollama. No cloud API calls.
 
 ---
 
-## Model suitability table (D18, updated Session 8)
+## Model suitability table (D18/D32, updated Session 11)
 
 Checked at startup via `system_check.check_model_suitability()`. Confirmed on RTX 5050 8 GB VRAM / 24 GB RAM.
+Viability = `free_vram + free_ram >= model_weight` (total-memory pool — D32).
 
-| Model | VRAM needed | RAM needed | Status on RTX 5050 | Coexists with |
-|---|---|---|---|---|
-| `qwen2.5vl:7b` | ~7.3 GB | 9.0 GB | **ready (GPU)** | `qwen3:8b` (safe) |
-| `qwen3:8b` | ~5.2 GB | 5.5 GB | **ready (GPU)** | `qwen2.5vl:7b` (safe) |
-| `qwen3-vl:4b` | ~3.5 GB | 4.5 GB | **ready (GPU)** | both (safe — all three coexist) |
-| `gemma4:latest` | 9.6 GB (split) | — | **ready (CPU+GPU)** — only after teardown | loaded alone only (Phase 9) |
+| Model | Weight | Status on RTX 5050 | Display |
+|---|---|---|---|
+| `qwen2.5vl:7b` | ~7.3 GB | fully in VRAM when ≥ 7.3 GB free | **ready (GPU)** — green |
+| `qwen2.5vl:7b` | ~7.3 GB | ~7.0 GB VRAM + ~0.3 GB RAM | **ready (auto-split)** — cyan |
+| `qwen3:8b` | ~5.2 GB | fully in VRAM | **ready (GPU)** — green |
+| `qwen3-vl:4b` | ~3.5 GB | fully in VRAM | **ready (GPU)** — green |
+| `gemma4:latest` | ~9.6 GB | after teardown: ~8 GB GPU + ~1.6 GB RAM | **ready (auto-split)** — cyan |
 
-`MIN_FREE_RAM_GB = 9.0` in `config.py` — minimum to start a parse with vision enabled.
+`MIN_FREE_RAM_GB = 9.0` in `config.py` — minimum free RAM gate shown in startup warning.
 
 ---
 
@@ -61,13 +63,15 @@ gemma4:latest  — 9.6 GB. Used only for Phase 9 deep review after teardown.
                   DEEP_REVIEW_TIMEOUT = 600s — slower on split.
 ```
 
-### Loading rules enforced by `model_router.py`
+### Loading rules enforced by `model_router.py` (Session 11)
 
-1. `_probe_vision()` runs at start of each PDF — tries VISION_PRIMARY then VISION_FALLBACK.
+1. `_probe_vision()` runs at start of each PDF — tries VISION_PRIMARY then VISION_FALLBACK (respects ParsePlan.model_tier via `vision_models_to_try()`).
 2. Whichever model passes the probe is set as the **sticky model** for the whole PDF via `mark_success()`.
-3. Phase boundaries (`before_vision_phase` / `before_orchestrator_phase`) are called at phase starts — with qwen3-vl:4b fallback these are no-ops (all models coexist safely).
-4. `teardown_pdf()` — at end of each PDF: unloads vision model, resets sticky state.
-5. **Sticky model:** once a vision model succeeds, all calls reuse it for that PDF. No repeated load/unload churn.
+3. `before_vision_phase()` — always unloads orchestrator before the vision phase. Frees GPU layers for the vision model's auto-split.
+4. `before_orchestrator_phase()` — always unloads the sticky vision model before the orchestrator phase. Sticky model is remembered (not reset) for the next vision phase.
+5. `teardown_pdf()` — at end of each PDF: unloads vision model, resets sticky state + ParsePlan.
+6. **Sticky model:** once a vision model succeeds, all calls reuse it for that PDF. No repeated probe churn.
+7. **`keep_alive=-1`** — models stay loaded indefinitely within a phase; unloads only fire at explicit phase boundaries.
 
 ---
 
@@ -77,10 +81,10 @@ gemma4:latest  — 9.6 GB. Used only for Phase 9 deep review after teardown.
 |---|---|---|---|
 | `num_ctx` | 4096 | `MODEL_NUM_CTX` | Smaller KV cache → less RAM |
 | `num_ctx` (FORMAT only) | 8192 | `FORMAT_NUM_CTX` | Larger context for Phase 4 — prevents qwen3 thinking tokens truncating output |
-| `keep_alive` | 0 | `MODEL_KEEP_ALIVE` | Model unloads immediately after call — explicit teardown handles lifecycle |
+| `keep_alive` | -1 | `MODEL_KEEP_ALIVE` | Model stays loaded until explicit phase-boundary unload (D11) |
 | `temperature` | 0.1 | hardcoded | Deterministic extraction |
 
-> `MODEL_KEEP_ALIVE = 0` replaces the previous 600s value. Explicit phase-based unloads (via `model_router`) make the keep_alive warm-up unnecessary and wasteful.
+> `MODEL_KEEP_ALIVE = -1` (Session 11) keeps models loaded within a phase — no cold reloads per judge call. Explicit phase-boundary unloads (`before_vision_phase` / `before_orchestrator_phase`) still fire via `model_router.unload()` which forces immediate release regardless of session keep_alive. See D11.
 
 ---
 
@@ -161,9 +165,10 @@ Structured audit comparing raw pdfplumber text vs final markdown. Produces secti
 
 ---
 
-## Known hardware limits on dev machine (Session 8)
+## Known hardware limits on dev machine (Session 11)
 
-- `qwen2.5vl:7b` is the **target primary model** — loads when ≥ 9 GB RAM free (close Chrome first). Shows `ready (GPU)` when ≥ 7.3 GB VRAM free
-- `qwen3-vl:4b` is the **fallback** — loads in 3.5 GB VRAM, always `ready (GPU)` on RTX 5050
-- **To unlock the full quality loop:** free ≥ 9 GB RAM before running
-- `VISION_TIMEOUT` = 400s, `DEEP_REVIEW_TIMEOUT` = 600s (gemma4 is slower on CPU+GPU split)
+- `qwen2.5vl:7b` — `ready (GPU)` when ≥ 7.3 GB VRAM free; `ready (auto-split)` when total memory ≥ 7.3 GB; Ollama handles the split automatically
+- `qwen3-vl:4b` — always `ready (GPU)` on RTX 5050 (3.5 GB easily fits)
+- `gemma4:latest` — Phase 9 only, after teardown; ~8 GB GPU + ~1.6 GB RAM split; `DEEP_REVIEW_TIMEOUT = 600s`
+- **To maximise GPU layers:** run `cloak parse` — it calls `run_startup_cleanup()` to free idle models first
+- `VISION_TIMEOUT` = 400s; heavier auto-split runs are still within budget

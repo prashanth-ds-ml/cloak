@@ -1,11 +1,63 @@
 ---
 type: session-log
-updated: 2026-05-16 (Session 8)
+updated: 2026-05-20 (Session 11)
 ---
 
 # Progress — cloak
 
 > Read this first every session. | [[CLAUDE.md]] · [[ARCHITECTURE.md]] · [[MODULES.md]] · [[MODELS.md]] · [[DECISIONS.md]]
+
+---
+
+## Current state — end of 2026-05-20 (Session 11)
+
+**Total-memory routing (D32) and keep_alive=-1 (D11) locked in. All modules consistent.**
+
+Session 11 focused on model routing correctness and memory lifecycle:
+
+- **D32 (new)**: Total-memory routing — model viability = `free_vram + free_ram >= model_weight`. Ollama auto-splits any model across GPU + CPU RAM. Old VRAM-only check was incorrectly routing to fallback when primary would fit via auto-split. Fixed in `model_router.py`, `system_check.py`, `doc_profiler.py`, `parser_agent.py`.
+- **D11 (updated)**: `MODEL_KEEP_ALIVE = -1` — models stay loaded within a phase; explicit phase-boundary unloads handle lifecycle. Old `keep_alive=0` caused up to 10 cold reloads per judge round (one per page). Phase boundaries (`before_vision_phase` / `before_orchestrator_phase`) now always fire unconditionally.
+- **`get_page_elements` tool**: Added to parser agent's patch loop — agent can inspect docling structural element map for any page while patching.
+- **`run_startup_cleanup()` in parse**: Added to `cloak parse` command so idle Ollama models are freed before every parse run.
+- **Bug fixed**: `parser_agent.py` line 1083 referenced `model_router._VISION_PRIMARY_VRAM_GB` (removed in Session 10) → AttributeError crash. Fixed by using `model_router._MODEL_SIZE_GB.get(VISION_PRIMARY, 7.3)`.
+- **`build_parse_plan()` param rename**: `gpu_available` → `primary_viable` to reflect total-memory semantics.
+- **Suitability display**: startup screen now shows `ready (auto-split)` (cyan) for models spanning GPU+RAM; removed misleading 85% `marginal (GPU)` band.
+
+**Next session:** end-to-end parse run — `cloak parse data/raw/cardiology/stemi.pdf`
+
+---
+
+## Current state — end of 2026-05-19 (Session 10)
+
+**D28–D31 fully implemented. Docling + Surya integrated. All modules working.**
+
+Session 10 implemented all four decisions from the Session 9 design:
+
+- **D28**: `profiling/doc_profiler.py` built — `DocProfile` + `ParsePlan`. `build_doc_profile()` aggregates page type distribution + picture counts from docling for vision_dependency. `build_parse_plan()` produces adaptive max_rounds, judge_sample_rate, model_tier. `model_router.set_parse_plan()` stores plan; `vision_models_to_try()` now respects model_tier ("none"/"fallback"/"primary").
+- **D29**: `run_docling_pass()` runs docling layout analysis (CPU, do_ocr=False). Produces `DoclingPageMap` per-page. `_extract_docling_page()` in parser_agent uses element map for structured extraction: title/section_header → heading hierarchy, table → export_to_markdown(), picture → vision region crop + describe, footnote → collected + appended. PageHeader/PageFooter discarded. `update_vision_from_docling()` refines `needs_vision` to only pages with actual picture elements.
+- **D30**: `extraction/ocr_tools.py` updated — `_ocr_page_surya()` uses surya 0.17.1 with lazy-loaded `RecognitionPredictor` + `DetectionPredictor`. `ocr_page()` dispatches: surya first, tesseract fallback. `is_surya_available()` added. `is_available()` returns True if either engine is ready.
+- **D31**: `quality/quality_judge.py` updated — `structure_score: float = 0.0` added to `PageScore`. `_compute_structure_score()` heuristic checks heading presence, table separator rows, page-header pollution. `judge()` combines: `final = 0.7 * content + 0.3 * structure`.
+
+**Key bug fixed:** `run_docling_pass` was using string `"pdf"` as `format_options` key instead of `InputFormat.PDF` enum. Docling silently ignored the options dict, ran with `do_ocr=True`, and item iteration failed. Fix: use `InputFormat.PDF` enum key, split item extraction into `_add_item()` helper (isolates per-item errors), remove `del converter, result` from finally block (was triggering pypdfium2 destructor warnings).
+
+**Packages installed:** `docling 2.94.0`, `surya-ocr 0.17.1`
+
+**Verified:** `run_docling_pass(stemi.pdf)` → 44 elements, 14 section_headers, 5 pictures, 20 list_items. DocProfile + ParsePlan built correctly.
+
+---
+
+## Current state — end of 2026-05-18 (Session 9)
+
+**Design session. No code changes. Four new decisions locked in (D28–D31).**
+
+Session 9 was a design discussion focused on the root causes of speed and quality problems observed in the real 11-PDF + 828-page batch run. Key outcomes:
+
+- **D28**: Two-level profiler — DocProfile + ParsePlan. Before loading any model, aggregate page profiles into a doc-level signal that drives model tier selection, round budget, and judge sampling rate adaptively. Fixes: 30s vision probe per PDF, fixed MAX_ROUNDS regardless of doc size.
+- **D29**: Docling as structural extraction foundation. Docling's layout model (DocLayNet, 258 MB) runs first and produces a structured element map — headings with hierarchy levels, tables, figures, footnotes, reading order. Fixes: lost headings, wrong reading order, page header pollution, orphaned footnotes. Vision narrowed to: figure description + quality judge + patches only.
+- **D30**: Surya replaces Tesseract as primary OCR for scanned pages (Tesseract kept as fallback). Better reading order detection, 90+ language support, GPU-accelerated on RTX 5050.
+- **D31**: Markdown output standard defined — heading hierarchy, figure captions, footnote linking. Structural fidelity added as second judge scoring axis (30% weight alongside 70% content completeness).
+
+**Next session:** install docling + surya, implement DocProfile + ParsePlan in `profiling/`, wire into `parser_agent.py`.
 
 ---
 
@@ -60,15 +112,16 @@ winget install UB-Mannheim.TesseractOCR
 |---|---|---|---|
 | 1 | PDF extractor | `extraction/pdf_tools.py` | **done + tested** |
 | 2 | Vision model calls | `vision/vision_tools.py` | **done** — `full_page_extract`, `region_describe`, `judge_quality`; `layout_hints` removed (D23) |
-| 3 | Quality judge | `quality/quality_judge.py` | **done** — PageScore with per-page confidence (D24) |
-| 4 | Model router | `orchestration/model_router.py` | **done + wired** — phase-based (D14); fallback is now qwen3-vl:4b |
+| 3 | Quality judge | `quality/quality_judge.py` | **done** — structural fidelity scoring (D31) |
+| 4 | Model router | `orchestration/model_router.py` | **done** — total-memory routing (D32); ParsePlan tier (D28) |
 | 5 | Context compressor | `orchestration/context_manager.py` | **done** |
-| 6 | Orchestrator | `orchestration/parser_agent.py` | **done** — 9-phase pipeline; vision for all page types (D23); region image persistence; Phase 9 integration |
-| 7 | Page profiler | `profiling/page_profiler.py` | **done** — 5-type heuristic classification (D21) |
-| 8 | OCR tools | `extraction/ocr_tools.py` | **done** — Tesseract wrapper, graceful fallback (D22) |
-| 9 | Hardware check | `cli/system_check.py` | **done** — VRAM-aware suitability check; startup cleanup; startup screen only on `cloak`/`cloak status` (D17/D18) |
-| 10 | CLI | `cli/main.py` | **done** — `parse/status/list`; `--no-review` flag; startup screen not shown on `parse` (D17) |
-| 11 | Deep review | `quality/deep_review.py` | **done** — Phase 9; gemma4:latest; CPU+GPU split; `{stem}_review.md` (D27) |
+| 6 | Orchestrator | `orchestration/parser_agent.py` | **done** — ParsePlan wiring (D28/D29); get_page_elements tool |
+| 7 | Page profiler | `profiling/page_profiler.py` | **done** — update_vision_from_docling (D29) |
+| 8 | OCR tools | `extraction/ocr_tools.py` | **done** — Surya primary, Tesseract fallback (D30) |
+| 9 | Hardware check | `cli/system_check.py` | **done** — total-memory suitability; auto-split display; startup cleanup (D32/D18) |
+| 10 | CLI | `cli/main.py` | **done** — parse/status/list; run_startup_cleanup in parse (D17) |
+| 11 | Deep review | `quality/deep_review.py` | **done** — Phase 9; gemma4:latest; CPU+GPU split (D27) |
+| 12 | Doc profiler | `profiling/doc_profiler.py` | **done** — DocProfile + ParsePlan; primary_viable param (D28/D32) |
 | — | Legacy reference | `ingestion/pdf_extractor.py` | read-only |
 | — | Legacy reference | `ingestion/pdf_classifier.py` | read-only |
 | — | Legacy reference | `ingestion/vision.py` | read-only |
@@ -77,6 +130,45 @@ winget install UB-Mannheim.TesseractOCR
 ---
 
 ## Sessions
+
+### 2026-05-20 — Session 11: Total-memory routing, keep_alive=-1, get_page_elements
+
+**Done**
+
+- **D32**: Total-memory routing — `free_vram + free_ram` replaces VRAM-only check everywhere. `model_router.vision_models_to_try()` uses combined pool. `system_check.check_model_suitability()` now shows `ready (auto-split)` for models spanning GPU+RAM (cyan, not yellow). Removed 85% marginal band.
+- **D11 updated**: `MODEL_KEEP_ALIVE = -1` — models stay warm within a phase. Phase boundaries always fire unconditionally: `before_vision_phase()` always unloads orchestrator; `before_orchestrator_phase()` always unloads vision model. Sticky vision model preserved across phases.
+- **`get_page_elements` tool**: Added to `_TOOLS` list and `_execute_tool()` handler in parser_agent. Agent can inspect the docling structural element map for any page while in the patch loop.
+- **`run_startup_cleanup()` in parse**: Added to `cloak parse` command — frees idle Ollama models before every parse run.
+- **Bug fix**: `parser_agent.py` crash at line 1083 — `model_router._VISION_PRIMARY_VRAM_GB` AttributeError (removed in Session 10). Fixed: `model_router._MODEL_SIZE_GB.get(VISION_PRIMARY, 7.3)`.
+- **`build_parse_plan()` param rename**: `gpu_available: bool` → `primary_viable: bool` in `doc_profiler.py` + call site in `parser_agent.py`.
+- **Doc sweep**: DECISIONS.md (D11, D14, D18 updated; D32 added), PROGRESS.md, MODELS.md, CLAUDE.md, memory all updated to match Session 11 state.
+
+---
+
+### 2026-05-18 — Session 9: Design — DocProfile, ParsePlan, docling, surya
+
+**Design only — no code changed this session.**
+
+- Defined the missing planning layer: DocProfile aggregates page profiles before any model loads; ParsePlan drives adaptive round budget, model tier, judge sampling rate (D28)
+- Defined docling as structural extraction foundation: element map with heading hierarchy, reading order, table/figure/footnote classification; vision role narrowed to figure description + judging + patches (D29)
+- Defined surya as primary OCR upgrade over Tesseract for scanned pages; Tesseract kept as fallback (D30)
+- Defined markdown output standard and structural fidelity as second judge scoring axis — 0.7 content + 0.3 structure (D31)
+- Identified root causes of data loss: wrong reading order, lost heading hierarchy, page header pollution, orphaned footnotes — all structural problems that no judge→patch rounds can recover
+- Identified root cause of speed/RAM issues: vision probe runs for every PDF regardless of doc content; fixed round budget regardless of doc size
+- Added Module 12 (doc_profiler) to module list
+
+**New decisions → see [[docs/DECISIONS.md]] §D28 §D29 §D30 §D31**
+
+**Next session implementation order:**
+1. `pip install docling surya` + verify GPU acceleration
+2. Build `profiling/doc_profiler.py` — DocProfile + ParsePlan (D28)
+3. Update `profiling/page_profiler.py` — integrate docling element map (D29)
+4. Update `extraction/ocr_tools.py` — Surya primary, Tesseract fallback (D30)
+5. Update `orchestration/model_router.py` — consume ParsePlan for model tier (D28)
+6. Update `orchestration/parser_agent.py` — wire ParsePlan + docling extraction phase
+7. Update `quality/quality_judge.py` — structural fidelity scoring (D31)
+
+---
 
 ### 2026-05-16 — Session 8: Phase 9, fallback swap, heading fix, CLI cleanup
 

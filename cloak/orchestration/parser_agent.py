@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -39,6 +40,7 @@ from cloak.config import (
     AGENT_TIMEOUT,
     CONTENT_LOSS_LIMIT,
     FORMAT_NUM_CTX,
+    FORMAT_TIMEOUT,
     JUDGE_SKIP_THRESHOLD,
     LOW_CONFIDENCE_THRESHOLD,
     MAX_AGENT_ITERS,
@@ -48,6 +50,7 @@ from cloak.config import (
     MODEL_NUM_CTX,
     ORCHESTRATOR_MODEL,
     QUALITY_THRESHOLD,
+    VISION_PRIMARY,
 )
 from cloak.extraction.pdf_tools import PageData, load_pages
 from cloak.orchestration import context_manager, model_router
@@ -66,6 +69,7 @@ from cloak.profiling.page_profiler import (
 from cloak.profiling.page_profiler import summarise as summarise_profiles
 from cloak.quality import quality_judge
 from cloak.quality.quality_judge import QualityMetrics, compute_metrics
+from cloak.quality import postprocess
 from cloak import registry as _registry
 from cloak.vision import vision_tools
 
@@ -225,13 +229,11 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Signal that patching is complete. Returns the final markdown.",
+            "description": "Signal that all patches are done. Call this when you have filled all gaps. No arguments needed — the draft is updated automatically by patch_section/add_section.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "markdown": {"type": "string", "description": "The complete, final markdown."},
-                },
-                "required": ["markdown"],
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -300,24 +302,23 @@ def _execute_tool(
 
     if name == "patch_section":
         heading = args.get("heading", "")
-        content = args.get("content", "")
+        content = _strip_think_artifacts(args.get("content", ""))
         new_draft = _replace_section(draft, heading, content)
         return f"Section '{heading}' patched.", new_draft
 
     if name == "add_section":
         heading = args.get("heading", "")
-        content = args.get("content", "")
+        content = _strip_think_artifacts(args.get("content", ""))
         new_draft = draft + f"\n\n## {heading}\n\n{content}"
         return f"Section '{heading}' added.", new_draft
 
     if name == "finish":
-        return "__FINISH__", args.get("markdown", draft)
+        return "__FINISH__", draft
 
     return f"Unknown tool: {name}", draft
 
 
 def _replace_section(markdown: str, heading: str, content: str) -> str:
-    import re
     pattern = rf"(##\s+{re.escape(heading)}\s*\n)(.*?)(?=\n##\s|\Z)"
     replacement = rf"\g<1>{content}\n"
     new = re.sub(pattern, replacement, markdown, flags=re.DOTALL | re.IGNORECASE)
@@ -327,10 +328,10 @@ def _replace_section(markdown: str, heading: str, content: str) -> str:
 # ── Agent tool-calling loop (Phase 6) ────────────────────────────────────────
 
 _PATCH_SYSTEM = """\
-You are patching gaps in an extracted document.
-Use the available tools to retrieve missing content from the PDF and add it to the markdown.
+You are patching gaps in an extracted PDF document.
+Use patch_section() or add_section() to fill missing content retrieved via get_page_text() or get_page_elements().
 Do NOT remove or rewrite existing content — only add what is missing.
-When done, call finish() with the complete updated markdown."""
+When all gaps are filled, call finish() with no arguments."""
 
 
 def _run_patch_loop(
@@ -343,13 +344,17 @@ def _run_patch_loop(
 ) -> str:
     """Run the qwen3:8b tool-calling loop to fill gaps. Returns updated markdown."""
     gap_text = "\n".join(f"- {g}" for g in gaps[:20])
+    headings = [ln.lstrip("#").strip() for ln in draft.splitlines() if ln.startswith("##")]
+    heading_outline = "\n".join(f"  {h}" for h in headings[:40]) if headings else "  (no headings)"
     messages = list(messages)
     messages.append({
         "role": "user",
         "content": (
             f"The quality judge found these gaps in the current extraction:\n{gap_text}\n\n"
-            f"Please fill them using the available tools. "
-            f"Current draft has {len(draft)} characters."
+            f"Document sections available for patch_section():\n{heading_outline}\n\n"
+            f"Use get_page_text() or get_page_elements() to retrieve missing content, "
+            f"then call patch_section() or add_section() to fill each gap. "
+            f"Call finish() with no arguments when done."
         ),
     })
 
@@ -364,7 +369,7 @@ def _run_patch_loop(
                     model=ORCHESTRATOR_MODEL,
                     messages=messages,
                     tools=_TOOLS,
-                    options={"temperature": 0.1, "num_ctx": MODEL_NUM_CTX},
+                    options=_orchestrator_options(think=True, num_ctx=MODEL_NUM_CTX),
                     keep_alive=MODEL_KEEP_ALIVE,
                 )
                 result_q.put(("ok", resp))
@@ -376,7 +381,11 @@ def _run_patch_loop(
         try:
             kind, value = result_q.get(timeout=AGENT_TIMEOUT)
         except queue.Empty:
-            console.print(f"  [yellow]Agent timeout on iteration {iteration + 1}[/yellow]")
+            from cloak.vision import vision_tools as _vt_patch
+            reason = _vt_patch._stall_reason(ORCHESTRATOR_MODEL, 0, AGENT_TIMEOUT)
+            console.print(
+                f"  [yellow]Patch timeout iter {iteration + 1} — {reason}[/yellow]"
+            )
             break
 
         if kind == "err":
@@ -442,6 +451,7 @@ def _extract_docling_page(
     vision_available: bool,
     model: str,
     images_dir: Path | None = None,
+    use_math_ocr: bool = False,
 ) -> str:
     """
     Build structured markdown from a docling element map for one page (D29).
@@ -467,8 +477,17 @@ def _extract_docling_page(
                 parts.append(f"{hashes} {el.text}")
 
         elif label == "table":
-            if el.table_md.strip():
-                parts.append(el.table_md)
+            table_content = el.table_md.strip()
+            # GLM-OCR: try bbox crop for better complex-table extraction (D45)
+            if pg.image is not None and el.bbox_norm:
+                crop = _crop_normalized(pg.image, el.bbox_norm)
+                if crop is not None:
+                    from cloak.extraction.ocr_tools import extract_table_glm
+                    glm_result = extract_table_glm(crop)
+                    if len(glm_result) > len(table_content):
+                        table_content = glm_result
+            if table_content:
+                parts.append(table_content)
 
         elif label == "picture":
             if vision_available and pg.image is not None:
@@ -501,7 +520,15 @@ def _extract_docling_page(
                 footnotes.append(el.text)
 
         elif label == "formula":
-            if el.text.strip():
+            rendered = ""
+            if use_math_ocr and pg.image is not None:
+                crop = _crop_normalized(pg.image, el.bbox_norm)
+                if crop is not None:
+                    from cloak.extraction import math_ocr
+                    rendered = math_ocr.ocr_equation(crop)
+            if rendered:
+                parts.append(f"$$\n{rendered}\n$$")
+            elif el.text.strip():
                 parts.append(f"`{el.text}`")
 
         else:
@@ -586,6 +613,71 @@ def _extract_text_page_vision(
     return "\n\n".join(p for p in parts if p)
 
 
+def _extract_poster_page(pg: PageData, model: str) -> str:
+    """
+    D51: full-page VLM extraction for clinical flowcharts and poster-format PDFs.
+    Bypasses docling and pdfplumber — the VLM reads the rendered page image and
+    follows the visual branching structure that pdfplumber cannot reconstruct.
+    Falls back to pdfplumber text on vision failure.
+    """
+    if pg.image is None:
+        return _extract_text_page(pg)
+    try:
+        md = vision_tools.poster_page(pg.image, model=model)
+        model_router.mark_success(model)
+        return md
+    except (vision_tools.VisionTimeoutError, vision_tools.VisionCallError) as exc:
+        console.print(
+            f"  [yellow]Poster vision failed page {pg.page_num}: {type(exc).__name__}"
+            f" — text fallback[/yellow]"
+        )
+        return _extract_text_page(pg)
+
+
+def _extract_slide_page(
+    pg: PageData,
+    model: str,
+    images_dir: Path | None = None,
+) -> str:
+    """D38: slide deck mode — send full page image with slide-specific prompt."""
+    if pg.image is None:
+        return _extract_text_page(pg)
+    try:
+        md = vision_tools.slide_page(pg.image, model=model)
+        model_router.mark_success(model)
+        if images_dir is not None:
+            rel = _save_region(pg.image, images_dir, pg.page_num, "slide", 0)
+            md = f"![slide]({rel})\n\n{md}"
+        return md
+    except (vision_tools.VisionTimeoutError, vision_tools.VisionCallError) as exc:
+        console.print(
+            f"  [yellow]Slide vision failed page {pg.page_num}: {type(exc).__name__}"
+            f" — text fallback[/yellow]"
+        )
+        return _extract_text_page(pg)
+
+
+def _extract_exam_page(
+    pg: PageData,
+    model: str,
+) -> str:
+    """
+    D39: exam_mode — full-page VLM extraction for JEE/GATE/ESE question paper pages.
+    Docling text is bypassed because Symbol-font math is fragmented and unreadable.
+    """
+    if pg.image is not None:
+        try:
+            md = vision_tools.exam_page(pg.image, model=model)
+            model_router.mark_success(model)
+            return md
+        except (vision_tools.VisionTimeoutError, vision_tools.VisionCallError) as exc:
+            console.print(
+                f"  [yellow]Exam vision failed page {pg.page_num}: {type(exc).__name__}"
+                f" — text fallback[/yellow]"
+            )
+    return _extract_text_page(pg)
+
+
 def _extract_table_page(pg: PageData) -> str:
     """table_heavy: pdfplumber tables only — raw text excluded to prevent duplication."""
     table_mds = [tbl.to_markdown() for tbl in pg.tables if tbl.to_markdown().strip()]
@@ -593,7 +685,7 @@ def _extract_table_page(pg: PageData) -> str:
 
 
 def _extract_scanned_page(pg: PageData) -> str:
-    """scanned: Tesseract OCR. Falls back to raw PyMuPDF text on OCRError (D22)."""
+    """scanned: Surya OCR primary, Tesseract fallback. Falls back to raw PyMuPDF text on OCRError (D30)."""
     from cloak.extraction import ocr_tools
     if pg.image is None:
         return pg.text
@@ -645,6 +737,57 @@ def _extract_mixed_page(
     return md
 
 
+def _detect_poster(pages: list[PageData], element_map: DoclingPageMap | None) -> bool:
+    """
+    D51: detect clinical flowchart / poster-format documents.
+
+    Signal: short doc (<=5 pages) where pdfplumber extracts substantial text but
+    docling finds very few structured text elements per page. This mismatch
+    indicates a complex visual layout (flowchart boxes + arrows as PDF vector art)
+    that docling cannot parse but pdfplumber can partially read out-of-order.
+
+    Sending these pages through full-page VLM extraction with a specialized
+    poster prompt produces correct clinical content with proper branching structure.
+    """
+    if len(pages) > 5:
+        return False
+    if element_map is None:
+        return False
+    for pg in pages:
+        elements = element_map.get(pg.page_num, [])
+        text_elements = [
+            e for e in elements
+            if e.label in ("text", "section_header", "list_item", "paragraph")
+        ]
+        # Lots of pdfplumber text but very few docling text elements = visual flowchart layout
+        if len(pg.text) > 800 and len(text_elements) < 8:
+            return True
+    return False
+
+
+def _detect_exam_paper(pages: list[PageData]) -> bool:
+    """
+    D39: heuristic check — True when the document looks like JEE/GATE/ESE exam paper.
+    Samples the first 5 pages (covers instructions + first question block).
+    """
+    import re
+    _EXAM_RE = re.compile(
+        r'Q\.?\s*\d+\b'                          # Q.1 / Q1
+        r'|Maximum\s+Marks'                       # exam header
+        r'|GATE\s+\d{4}'                          # GATE 2024
+        r'|JEE.{0,20}(?:Advanced|Main)'           # JEE Advanced / JEE Main
+        r'|ESE\s+\d{4}|IES\s+\d{4}'             # ESE 2023 / IES 2023
+        r'|UPSC\s+(?:ESE|IES)'                   # UPSC ESE
+        r'|(?:PART|PAPER)\s+[A-Z0-9]\b.*Marks',  # PART A — 20 Marks (specific)
+        re.IGNORECASE,
+    )
+    sample = pages[:5]
+    for pg in sample:
+        if _EXAM_RE.search(pg.text):
+            return True
+    return False
+
+
 def _extract_by_route(
     pages: list[PageData],
     route_map: dict[int, str],
@@ -652,20 +795,25 @@ def _extract_by_route(
     on_page_done=None,
     images_dir: Path | None = None,
     element_map: DoclingPageMap | None = None,
+    use_math_ocr: bool = False,
+    slide_mode: bool = False,
+    exam_mode: bool = False,
+    poster_mode: bool = False,
 ) -> str:
     """
     Phase 3: dispatch each page to its extraction strategy.
 
-    Docling path (D29) — used when element_map is available and page is not scanned:
-      _extract_docling_page() — uses heading hierarchy, reading order, figure crops
-
-    Fallback routing (D23) — when docling unavailable:
-      text_rich + vision  → _extract_text_page_vision  (full_page_extract)
-      image_heavy + vision → _extract_vision_page       (full_page_extract)
-      mixed + vision       → _extract_mixed_page        (text + region vision)
-      table_heavy          → _extract_table_page        (pdfplumber tables)
-      scanned              → _extract_scanned_page      (surya→tesseract, D30)
-      no-vision fallback   → _extract_text_page         (pdfplumber text)
+    Priority order:
+      poster_mode (D51)   → _extract_poster_page     (full VLM with flowchart prompt)
+      exam_mode (D39)     → _extract_exam_page        (full VLM with math prompt)
+      slide_mode (D38)    → _extract_slide_page       (full VLM with slide prompt)
+      docling path (D29)  → _extract_docling_page     (heading hierarchy + figure crops)
+      scanned             → _extract_scanned_page     (surya→tesseract OCR, D30)
+      image_heavy+vision  → _extract_vision_page      (full_page_extract)
+      mixed+vision        → _extract_mixed_page       (text + region vision)
+      table_heavy         → _extract_table_page       (pdfplumber tables)
+      text_rich+vision    → _extract_text_page_vision (full_page_extract)
+      fallback            → _extract_text_page        (pdfplumber text only)
     """
     parts: list[str] = []
     model = model_router.get_vision_model() if vision_available else ""
@@ -673,11 +821,30 @@ def _extract_by_route(
     for pg in pages:
         page_type = route_map.get(pg.page_num, "text_rich")
 
+        # D51: poster_mode — full VLM extraction, bypasses docling and pdfplumber entirely
+        if poster_mode and vision_available:
+            md = _extract_poster_page(pg, model)
+
+        # D39: exam_mode — bypass docling text for text_rich/mixed; use Mathpix or vision
+        elif exam_mode and page_type in ("text_rich", "mixed") and (vision_available or True):
+            md = _extract_exam_page(pg, model)
+
+        # D38: slide mode overrides docling for image_heavy/mixed pages — per-slide VLM prompt
+        elif slide_mode and vision_available and page_type in ("image_heavy", "mixed"):
+            md = _extract_slide_page(pg, model, images_dir=images_dir)
+
         # Docling path: structured extraction for all non-scanned pages (D29)
-        if element_map is not None and pg.page_num in element_map and page_type != "scanned":
+        elif element_map is not None and pg.page_num in element_map and page_type != "scanned":
             md = _extract_docling_page(
-                element_map[pg.page_num], pg, vision_available, model, images_dir
+                element_map[pg.page_num], pg, vision_available, model, images_dir,
+                use_math_ocr=use_math_ocr,
             )
+            # Gap A: if docling yielded nothing (TOC, complex layouts), fall back to pdfplumber
+            if not md.strip():
+                md = _extract_text_page(pg)
+            # Gap C: if docling text is garbled glyph codes, fall back to vision extraction
+            elif _is_garbled(md) and vision_available:
+                md = _extract_vision_page(pg, model)
 
         elif page_type == "scanned":
             # Always use OCR for scanned pages — docling's do_ocr=False means no text there (D30)
@@ -732,17 +899,88 @@ Rules:
    | --- | --- |
    Remove the original scattered lists; keep only this single merged table.
 
-5. Preserve ALL unique content. Do not summarise, paraphrase, or omit any information.
-6. Output ONLY the formatted markdown — no preamble, no closing remarks."""
+5. UNWRAP CODE FENCES — If content appears inside ```markdown...``` or ``` blocks that is NOT actual
+   code (commands, scripts, source code), remove the fence markers and include the content as regular
+   markdown. Only keep code fences around genuine code samples.
+
+6. Preserve ALL unique content. Do not summarise, paraphrase, or omit any information.
+7. Output ONLY the formatted markdown — no preamble, no closing remarks."""
 
 _NO_THINK_PREFIX = "/no_think\n"
 
+_THINK_BLOCK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_INLINE_RE  = re.compile(r"\s*/think\s*$", re.MULTILINE)
+
+
+def _strip_think_artifacts(text: str) -> str:
+    """Remove qwen3/gemma4 thinking-chain artifacts that leak into responses."""
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = _THINK_INLINE_RE.sub("", text)
+    return text.strip()
+
+
+def _orchestrator_options(think: bool, num_ctx: int) -> dict:
+    """Build Ollama options for the orchestrator. Adds think flag for gemma4/qwen3 (D49)."""
+    opts: dict = {"temperature": 0.1, "num_ctx": num_ctx}
+    model_lower = ORCHESTRATOR_MODEL.lower()
+    if "gemma4" in model_lower or "qwen3" in model_lower:
+        opts["think"] = think
+    return opts
+
+
+_LEADER_DOT_RE   = re.compile(r"(\n\.){3,}", re.MULTILINE)
+_GLYPH_CODE_RE   = re.compile(r"/g[0-9a-f]{2,4}", re.IGNORECASE)
+
+
+def _is_garbled(text: str) -> bool:
+    """Detect PDF glyph-code encoding artifacts (/gXX patterns) — Gap C."""
+    tokens = text.split()
+    if len(tokens) < 5:
+        return False
+    glyph_count = sum(1 for t in tokens if _GLYPH_CODE_RE.match(t))
+    return glyph_count / len(tokens) > 0.25
+
+
+def _clean_output_artifacts(text: str) -> str:
+    """Remove visual PDF artifacts that pollute markdown output."""
+    # Leader dot sequences
+    text = _LEADER_DOT_RE.sub("\n", text)
+    text = re.sub(r"^\.$", "", text, flags=re.MULTILINE)   # Gap D: standalone dot lines
+    # <math> watermark: "Digitized by Google" rendered as MathJax by vision model
+    text = re.sub(r"<math[^>]*>\\mathsf\{Digitized\}.*?</math>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<math[^>]*>.*?Digitized.*?</math>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Collapse 4+ consecutive blank lines to 2
+    text = re.sub(r"\n{4,}", "\n\n", text)
+    return text
+
 
 def _format_system_prompt() -> str:
-    """Prepend /no_think for qwen3 models (suppresses thinking chain)."""
+    """Prepend /no_think for qwen3 models. gemma4 uses think=False in options instead."""
     if "qwen3" in ORCHESTRATOR_MODEL.lower():
         return _NO_THINK_PREFIX + _FORMAT_SYSTEM_BODY
     return _FORMAT_SYSTEM_BODY
+
+
+def _content_needs_format(content: str) -> bool:
+    """
+    Heuristic: does this content actually need FORMAT cleanup?
+    Skip FORMAT for already-clean docling text output — it's expensive and adds nothing.
+    Only run FORMAT when specific issues are detected.
+    """
+    # Code fences from VLM (e.g. ```markdown ... ```)
+    if "```" in content:
+        return True
+    # Think artifacts not yet stripped (safety net)
+    if "/think" in content or "<think>" in content:
+        return True
+    # Heading level skips (e.g. ## followed directly by ####)
+    if re.search(r"^##[^#].*\n+####[^#]", content, re.MULTILINE):
+        return True
+    # Consecutive blank H2 headings (docling artifact from page headers)
+    if re.search(r"^## \w+\n\n## \w+\n\n## \w+", content, re.MULTILINE):
+        return True
+    # No structural issues detected — skip FORMAT
+    return False
 
 
 def _run_format_session(raw_content: str) -> str:
@@ -750,7 +988,11 @@ def _run_format_session(raw_content: str) -> str:
     Phase 4: qwen3:8b cleans and consolidates pre-structured markdown (D20).
     Content already has ##/### headings from vision extraction — FORMAT deduplicates and tidies.
     Falls back to raw_content on failure, timeout, or content-loss (D5).
+    Skipped entirely if content_needs_format() returns False (saves 150-800s for clean docs).
     """
+    if not _content_needs_format(raw_content):
+        return raw_content
+
     char_cap = FORMAT_NUM_CTX * 3   # rough chars that fit within token budget
     content_in = raw_content[:char_cap]
     truncated = len(raw_content) > char_cap
@@ -759,34 +1001,64 @@ def _run_format_session(raw_content: str) -> str:
 
     result_q: queue.Queue = queue.Queue()
 
+    from cloak.vision import vision_tools as _vt_fmt
+
+    chunks: list[str] = []
+    token_count = 0
+    last_token_at = [time.monotonic()]
+    error_holder: list[Exception | None] = [None]
+    done_event = threading.Event()
+    fmt_start = time.monotonic()
+
     def _worker() -> None:
+        nonlocal token_count
         try:
-            resp = ollama.chat(
+            for chunk in ollama.chat(
                 model=ORCHESTRATOR_MODEL,
                 messages=[
                     {"role": "system", "content": _format_system_prompt()},
-                    {"role": "user", "content": user_msg},
+                    {"role": "user",   "content": user_msg},
                 ],
-                options={"temperature": 0.1, "num_ctx": FORMAT_NUM_CTX},
+                options=_orchestrator_options(think=False, num_ctx=FORMAT_NUM_CTX),
                 keep_alive=MODEL_KEEP_ALIVE,
-            )
-            result_q.put(("ok", resp))
+                stream=True,
+            ):
+                piece = chunk.message.content or ""
+                if piece:
+                    chunks.append(piece)
+                    token_count += 1
+                    last_token_at[0] = time.monotonic()
         except Exception as exc:
-            result_q.put(("err", exc))
+            error_holder[0] = exc
+        finally:
+            done_event.set()
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
-    try:
-        kind, value = result_q.get(timeout=AGENT_TIMEOUT)
-    except queue.Empty:
-        console.print("  [yellow]FORMAT timeout — using raw content[/yellow]")
+
+    while not done_event.wait(timeout=0.5):
+        elapsed    = time.monotonic() - fmt_start
+        since_last = time.monotonic() - last_token_at[0]
+
+        if elapsed >= FORMAT_TIMEOUT:
+            reason = _vt_fmt._stall_reason(ORCHESTRATOR_MODEL, token_count, since_last)
+            console.print(f"  [yellow]FORMAT timeout ({reason}) — using raw content[/yellow]")
+            return raw_content
+
+        if since_last >= STALL_SECONDS and elapsed > 5:
+            reason = _vt_fmt._stall_reason(ORCHESTRATOR_MODEL, token_count, since_last)
+            console.print(f"  [yellow]FORMAT stalled — {reason} — using raw content[/yellow]")
+            return raw_content
+
+        cb = _vt_fmt._progress_cb
+        if cb is not None:
+            cb(token_count, elapsed, since_last, "format")
+
+    if error_holder[0] is not None:
+        console.print(f"  [yellow]FORMAT error: {error_holder[0]} — using raw content[/yellow]")
         return raw_content
 
-    if kind == "err":
-        console.print(f"  [yellow]FORMAT error: {value} — using raw content[/yellow]")
-        return raw_content
-
-    formatted = (value.message.content or "").strip()
+    formatted = _strip_think_artifacts("".join(chunks))
     if not formatted:
         return raw_content
 
@@ -938,7 +1210,7 @@ def _build_confidence_report(
         lines.append(f"| Completeness | {int(metrics.completeness_ratio * 100)}% words captured |")
         lines.append(f"| Structure | {metrics.heading_count} headings · {metrics.table_count} tables |")
         if metrics.review_score is not None:
-            lines.append(f"| Review Score | {metrics.review_score:.1f} / 10 (gemma4) |")
+            lines.append(f"| Review Score | {metrics.review_score:.1f} / 10 ({ORCHESTRATOR_MODEL}) |")
         lines += ["", "---", ""]
 
     if page_scores:
@@ -985,7 +1257,7 @@ def _print_metrics_summary(metrics: QualityMetrics) -> None:
 
     if metrics.review_score is not None:
         rc = _color(metrics.review_score, 8.0, 5.0)
-        rs = f"[{rc}]{metrics.review_score:.1f}/10[/{rc}] [dim](gemma4 deep review)[/dim]"
+        rs = f"[{rc}]{metrics.review_score:.1f}/10[/{rc}] [dim]({ORCHESTRATOR_MODEL} deep review)[/dim]"
         tbl.add_row("Review", rs, "", "")
 
     console.print()
@@ -997,7 +1269,8 @@ def _print_metrics_summary(metrics: QualityMetrics) -> None:
 
 def _probe_vision() -> bool:
     """Try vision models in VRAM-aware order. Returns False only if all fail."""
-    tiny = Image.new("RGB", (8, 8), color=(255, 255, 255))
+    # 64x64 minimum — qwen3-vl family crashes on images smaller than ~32x32
+    tiny = Image.new("RGB", (64, 64), color=(255, 255, 255))
 
     for model in model_router.vision_models_to_try():
         try:
@@ -1056,6 +1329,15 @@ def parse(
         border_style="cyan",
     ))
 
+    # Pre-flight: warn if Ollama is not reachable (extraction falls back to pdfplumber only)
+    if not model_router.is_ollama_available():
+        from cloak.config import OLLAMA_BASE_URL as _OLLAMA_URL
+        console.print(
+            f"  [yellow]⚠[/yellow]  Ollama not reachable at {_OLLAMA_URL}. "
+            "Extraction will use pdfplumber/docling only — no vision, no patching. "
+            "For full quality: [bold]ollama serve[/bold]"
+        )
+
     ui = _PhaseUI()
 
     # ── Phase 0: Load ─────────────────────────────────────────────────────────
@@ -1075,27 +1357,52 @@ def parse(
     if element_map:
         update_vision_from_docling(profiles, element_map)  # refine needs_vision (D29)
 
-    route_map = build_route_map(profiles)
-    counts    = summarise_profiles(profiles)
+    route_map         = build_route_map(profiles)
+    counts            = summarise_profiles(profiles)
 
     # Estimate model viability using total memory (VRAM + RAM) before the actual probe
     _est_vram    = model_router._free_vram_gb()
     _est_ram     = model_router._free_ram_gb()
     _primary_sz  = model_router._MODEL_SIZE_GB.get(VISION_PRIMARY, 7.3)
     _gpu_est     = (_est_vram + _est_ram) >= _primary_sz
-    doc_profile = build_doc_profile(profiles, element_map)
-    plan        = build_parse_plan(doc_profile, primary_viable=_gpu_est, use_docling=element_map is not None)
+    doc_profile  = build_doc_profile(profiles, element_map)
+    _exam_paper  = _detect_exam_paper(pages)
+    _poster      = _detect_poster(pages, element_map)
+    plan         = build_parse_plan(doc_profile, primary_viable=_gpu_est, use_docling=element_map is not None, exam_paper=_exam_paper, poster=_poster)
+
+    # D51: poster pages always need VLM judge — override docling's needs_vision=False
+    if _poster:
+        for p in profiles:
+            p.needs_vision = True
+
+    # D33: pages where needs_vision=False after docling refine → heuristic judge
+    _needs_vision_map = {p.page_num: p.needs_vision for p in profiles}
     model_router.set_parse_plan(plan)
 
     type_summary = "  ".join(f"{ptype}×{n}" for ptype, n in sorted(counts.items()))
     docling_str  = f"  [green]docling[/green]:{len(element_map)} pages" if element_map else ""
-    plan_str     = f"  [dim][{doc_profile.size_tier} · {plan.max_rounds}r · {int(plan.judge_sample_rate * 100)}%][/dim]"
-    ui.done(type_summary + docling_str + plan_str)
+    flags = []
+    if plan.use_math_ocr:
+        flags.append("math_ocr")
+    if plan.slide_mode:
+        flags.append("slide_mode")
+    if plan.exam_mode:
+        flags.append("exam_mode")
+    if plan.poster_mode:
+        flags.append("poster_mode")
+    flag_str  = ("  [cyan]" + " · ".join(flags) + "[/cyan]") if flags else ""
+    plan_str  = f"  [dim][{doc_profile.size_tier} · {plan.max_rounds}r · {int(plan.judge_sample_rate * 100)}%][/dim]"
+    ui.done(type_summary + docling_str + flag_str + plan_str)
 
     # ── Phase 2: Model staging — probe based on ParsePlan.model_tier ──────────
     ui.begin("2", "Route")
     model_router.reset()
     model_router.set_parse_plan(plan)   # re-set after reset()
+    # Unload orchestrator BEFORE probing so free-VRAM check is accurate (D43).
+    # Orchestrator stays warm between PDFs; without this, the probe sees near-zero
+    # free VRAM and always picks 4b even when 8b would fit after the unload.
+    if plan.model_tier != "none":
+        model_router.before_vision_phase()
     vision_available = _probe_vision()
     if not vision_available:
         if plan.model_tier == "none":
@@ -1112,8 +1419,7 @@ def parse(
 
     # ── Phase 3: Extraction — extract-once, D19/D23 ───────────────────────────
     ui.begin("3", "Extract")
-    if vision_available:
-        model_router.before_vision_phase()
+    # Orchestrator already unloaded before probe in Phase 2 (when vision is used)
 
     extract_t0 = time.monotonic()
     with Progress(
@@ -1125,53 +1431,100 @@ def parse(
         def _on_page_done(page_num: int, page_type: str) -> None:
             p.update(extract_task, advance=1, description=f"[dim]{page_type}[/dim]")
 
-        raw_content = _extract_by_route(
-            pages, route_map, vision_available, _on_page_done,
-            images_dir=images_dir, element_map=element_map,
-        )
+        def _on_token(tok: int, elapsed: float, since: float, lbl: str) -> None:
+            stall = f"  [yellow]⚠ no tokens {since:.0f}s — stall?[/yellow]" if since > 15 else ""
+            p.update(
+                extract_task,
+                description=f"[cyan]{lbl}[/cyan]  [dim]{tok:,} tok · {elapsed:.0f}s[/dim]{stall}",
+            )
+
+        from cloak.vision import vision_tools as _vt
+        _vt.set_progress_callback(_on_token)
+        try:
+            raw_content = _extract_by_route(
+                pages, route_map, vision_available, _on_page_done,
+                images_dir=images_dir, element_map=element_map,
+                use_math_ocr=plan.use_math_ocr,
+                slide_mode=plan.slide_mode,
+                exam_mode=plan.exam_mode,
+                poster_mode=plan.poster_mode,
+            )
+        finally:
+            _vt.set_progress_callback(None)
 
     extract_elapsed = time.monotonic() - extract_t0
     vision_model = model_router.get_vision_model() if vision_available else "text-only"
     ui._phase_t0 = extract_t0
     ui.done(f"{vision_model} · {len(pages)}/{len(pages)} pages · {len(raw_content):,} chars")
 
-    # Switch to orchestrator for Phase 4
-    model_router.before_orchestrator_phase()
-
     # ── Phase 4: FORMAT once — D20 ────────────────────────────────────────────
     ui.begin("4", "Format")
-    fmt_t0 = time.monotonic()
-    with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-        p.add_task("Formatting ...", total=None)
-        markdown = _run_format_session(raw_content)
+    fmt_t0    = time.monotonic()
+    needs_fmt = _content_needs_format(raw_content)
+
+    # Switch to orchestrator only if FORMAT will actually run — D37
+    if needs_fmt:
+        model_router.before_orchestrator_phase()
+
+    if needs_fmt:
+        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
+            fmt_task = p.add_task("Formatting ...", total=None)
+
+            def _fmt_token(tok: int, elapsed: float, since: float, lbl: str) -> None:
+                stall = f"  [yellow]⚠ no tokens {since:.0f}s[/yellow]" if since > 15 else ""
+                p.update(fmt_task, description=f"[cyan]format[/cyan]  [dim]{tok:,} tok · {elapsed:.0f}s[/dim]{stall}")
+
+            from cloak.vision import vision_tools as _vt2
+            _vt2.set_progress_callback(_fmt_token)
+            try:
+                markdown = _run_format_session(raw_content)
+            finally:
+                _vt2.set_progress_callback(None)
+    else:
+        markdown = raw_content
+
     fmt_elapsed = time.monotonic() - fmt_t0
 
     guard_ok = _content_loss_ok(raw_content, markdown)
     guard_str = "" if guard_ok else "  [yellow]⚠ guard triggered — raw kept[/yellow]"
+    skip_str  = "  [dim]skipped — already clean[/dim]" if not needs_fmt else ""
     ui._phase_t0 = fmt_t0
     ui.done(
-        f"{len(raw_content):,} → {len(markdown):,} chars{guard_str}",
+        f"{len(raw_content):,} → {len(markdown):,} chars{guard_str}{skip_str}",
         warn=not guard_ok,
+        skip=not needs_fmt,
     )
 
-    # ── Text-only path: skip judge-patch loop ─────────────────────────────────
+    # ── Text-only path: heuristic judge, then output ──────────────────────────
     if not vision_available:
         out_path  = _output_path(pdf_path)
         conf_path = _confidence_path(out_path)
-        out_path.write_text(markdown, encoding="utf-8")
+        out_path.write_text(postprocess.run(markdown), encoding="utf-8")
+
+        # Run heuristic judge on all pages (no vision needed — word-overlap only)
+        heur_scores: list[quality_judge.PageScore] = [
+            quality_judge.heuristic_judge(
+                page_num=pg.page_num,
+                page_text=pg.text,
+                extracted_md=markdown,
+                round_num=1,
+            )
+            for pg in pages
+        ]
 
         ui.begin("8", "Output")
         ui.done(f"{out_path.name}")
-
-        model_router.teardown_pdf()
 
         review_score: float | None = None
         if deep_review:
             review_score = _run_phase9(pdf_path, pages, markdown, out_path, ui)
 
-        metrics = compute_metrics([], pages, markdown, review_score)
+        # Teardown AFTER Phase 9 — LLM reused for deep review (D49)
+        model_router.teardown_pdf()
+
+        metrics = compute_metrics(heur_scores, pages, markdown, review_score)
         conf_path.write_text(
-            _build_confidence_report([], pdf_path.name, metrics), encoding="utf-8"
+            _build_confidence_report(heur_scores, pdf_path.name, metrics), encoding="utf-8"
         )
         _print_metrics_summary(metrics)
 
@@ -1179,7 +1532,7 @@ def parse(
                          status=_registry.DONE,
                          last_parsed=_registry.now_iso(),
                          elapsed_seconds=round(time.monotonic() - parse_t0, 1),
-                         judge_score=None,
+                         judge_score=metrics.judge_score if metrics.judged else None,
                          review_score=review_score,
                          completeness=metrics.completeness_ratio,
                          flagged_pages=0,
@@ -1223,6 +1576,10 @@ def parse(
 
         skipped = len(pages) - len(pages_to_judge) - len(carryover)
 
+        # D33: only call vision for pages that actually have visual content
+        vision_pages    = [pg for pg in pages_to_judge if _needs_vision_map.get(pg.page_num, True)]
+        heuristic_pages = [pg for pg in pages_to_judge if not _needs_vision_map.get(pg.page_num, True)]
+
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
             desc = f"Judging {len(pages_to_judge)}/{len(pages)} page(s)"
             n_carried = len(carryover)
@@ -1230,24 +1587,46 @@ def parse(
                 desc += f" · {n_carried} carried (≥{JUDGE_SKIP_THRESHOLD:.0f})"
             if skipped > 0:
                 desc += f" · {skipped} sampled out"
-            p.add_task(desc + " ...", total=None)
-            new_scores = [
-                quality_judge.judge(
-                    page_num=pg.page_num,
-                    page_image=pg.image,
-                    extracted_md=markdown,
-                    round_num=round_num,
-                    model=model_router.get_vision_model(),
-                )
-                for pg in pages_to_judge
-            ]
+            if heuristic_pages:
+                desc += f" · {len(heuristic_pages)} heuristic"
+            judge_task = p.add_task(desc + " ...", total=None)
+
+            def _judge_token(tok: int, elapsed: float, since: float, lbl: str) -> None:
+                stall = f"  [yellow]⚠ no tokens {since:.0f}s[/yellow]" if since > 15 else ""
+                p.update(judge_task, description=f"[cyan]{lbl}[/cyan]  [dim]{tok:,} tok · {elapsed:.0f}s[/dim]{stall}")
+
+            from cloak.vision import vision_tools as _vt_judge
+            _vt_judge.set_progress_callback(_judge_token)
+            try:
+                new_scores: list[quality_judge.PageScore] = []
+                # Heuristic judge: no vision call, word-overlap + structure score
+                for pg in heuristic_pages:
+                    new_scores.append(quality_judge.heuristic_judge(
+                        page_num=pg.page_num,
+                        page_text=pg.text,
+                        extracted_md=markdown,
+                        round_num=round_num,
+                    ))
+                # Vision judge: only for image_heavy / mixed / scanned pages
+                for pg in vision_pages:
+                    new_scores.append(quality_judge.judge(
+                        page_num=pg.page_num,
+                        page_image=pg.image,
+                        extracted_md=markdown,
+                        round_num=round_num,
+                        model=model_router.get_vision_model(),
+                    ))
+            finally:
+                _vt_judge.set_progress_callback(None)
 
         # Carry over high-scoring pages so they aren't re-judged next round
+        judged_nums = {ps.page_num for ps in new_scores}
         for ps in new_scores:
             if ps.score >= JUDGE_SKIP_THRESHOLD:
                 carryover[ps.page_num] = ps
 
-        page_scores = new_scores + list(carryover.values())
+        # Gap B: exclude carryover pages already in new_scores to avoid double-counting
+        page_scores = new_scores + [ps for ps in carryover.values() if ps.page_num not in judged_nums]
         avg_score, all_gaps, action = quality_judge.aggregate_page_results(page_scores)
 
         if avg_score > best.score:
@@ -1261,7 +1640,15 @@ def parse(
         if action == "accept" or round_num == _max_rounds:
             break
 
-        # Phase 6: Patch
+        # Phase 6: Patch — skip with a clear warning if Ollama is unreachable
+        if not model_router.is_ollama_available():
+            console.print(
+                "  [red]✗[/red]  [bold cyan]6[/bold cyan]  [bold]Patch[/bold]"
+                "  [red]Ollama unreachable — patch skipped. "
+                "Is Ollama running? Run: ollama serve[/red]"
+            )
+            break
+
         model_router.before_orchestrator_phase()
         patch_t0 = time.monotonic()
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
@@ -1272,6 +1659,8 @@ def parse(
                 images_dir=images_dir, element_map=element_map,
             )
 
+        pre_patch_len = len(markdown)
+        patch_changed = updated != markdown
         if not _content_loss_ok(markdown, updated):
             console.print(
                 f"  [red]Content-loss guard triggered "
@@ -1280,13 +1669,19 @@ def parse(
         else:
             markdown = updated
 
-        ui.patch_line(len(best.markdown), len(markdown), time.monotonic() - patch_t0)
+        ui.patch_line(pre_patch_len, len(markdown), time.monotonic() - patch_t0)
 
-    # ── Phase 8: Write output ─────────────────────────────────────────────────
+        if not patch_changed:
+            console.print(
+                "  [dim]Patch produced no changes — stopping early[/dim]"
+            )
+            break
+
+    # ── Phase 8 + 8.5: Post-process then write ───────────────────────────────
     ui.begin("8", "Output")
     out_path  = _output_path(pdf_path)
     conf_path = _confidence_path(out_path)
-    out_path.write_text(best.markdown, encoding="utf-8")
+    out_path.write_text(postprocess.run(best.markdown), encoding="utf-8")
     saved_count = len(list(images_dir.glob("*.png"))) if images_dir.exists() else 0
     images_str  = f"  {saved_count} image(s)" if saved_count else ""
     ui.done(
@@ -1295,11 +1690,13 @@ def parse(
     )
 
     _used_model = model_router.get_vision_model() or "text-only"
-    model_router.teardown_pdf()
 
     review_score: float | None = None
     if deep_review:
         review_score = _run_phase9(pdf_path, pages, best.markdown, out_path, ui)
+
+    # Teardown AFTER Phase 9 — LLM reused for deep review (D49)
+    model_router.teardown_pdf()
 
     metrics = compute_metrics(best.page_scores, pages, best.markdown, review_score)
     conf_path.write_text(
@@ -1342,12 +1739,15 @@ def _run_phase9(
     out_path: Path,
     ui: _PhaseUI,
 ) -> float | None:
-    """Phase 9: post-pipeline deep review (gemma4:latest). Returns score or None."""
+    """Phase 9: deep review using ORCHESTRATOR_MODEL already loaded from Phase 6 (D49)."""
     from cloak.config import DEEP_REVIEW_MODEL
     from cloak.quality import deep_review as dr
 
+    # Ensure LLM is active — unloads VLM if judge loop exited after a judge round (D49)
+    model_router.before_orchestrator_phase()
+
     ui.begin("9", "Deep Review")
-    console.print(f"       [dim]Loading {DEEP_REVIEW_MODEL} (CPU+GPU split) ...[/dim]")
+    console.print(f"       [dim]{DEEP_REVIEW_MODEL} (reusing loaded model)[/dim]")
 
     rev_path, rev_score = dr.run(
         pdf_path=pdf_path,

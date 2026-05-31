@@ -47,6 +47,7 @@ class DocProfile:
     vision_dependency: str                # "none" | "low" | "medium" | "high"
     complexity_score:  float              # 0.0–1.0; drives adaptive round budget
     size_tier:         str                # "small" | "medium" | "large" | "huge"
+    formula_count:     int = 0            # D35: total FormulaItem elements across all pages
 
 
 # ── ParsePlan ─────────────────────────────────────────────────────────────────
@@ -54,10 +55,15 @@ class DocProfile:
 @dataclass
 class ParsePlan:
     """Adaptive execution strategy derived from DocProfile. Overrides fixed constants."""
-    model_tier:        str    # "none" | "fallback" | "primary" — vision model to load
-    max_rounds:        int    # judge-patch round budget (overrides MAX_ROUNDS from config)
-    judge_sample_rate: float  # fraction of pages to judge per round (1.0 = all)
-    use_docling:       bool   # True when a valid DoclingPageMap is available
+    model_tier:        str          # "none" | "fallback" | "primary" — vision model to load
+    max_rounds:        int          # judge-patch round budget (overrides MAX_ROUNDS from config)
+    judge_sample_rate: float        # fraction of pages to judge per round (1.0 = all)
+    use_docling:       bool         # True when a valid DoclingPageMap is available
+    use_math_ocr:      bool = False # D35: crop FormulaItems and run pix2tex
+    math_ocr_engine:   str  = "none"# D35: "pix2tex" | "none"
+    slide_mode:        bool = False # D38: per-slide VLM extraction for presentation decks
+    exam_mode:         bool = False # D39: full-page math extraction for JEE/GATE/ESE papers
+    poster_mode:       bool = False # D51: full-page VLM extraction for clinical flowcharts/posters
 
 
 # ── Adaptive round table (D28) ────────────────────────────────────────────────
@@ -108,6 +114,12 @@ def build_doc_profile(
     else:
         vision_dependency = "high"
 
+    # D35: count FormulaItem elements to detect math-heavy documents
+    formula_count = 0
+    if element_map is not None:
+        for elems in element_map.values():
+            formula_count += sum(1 for el in elems if el.label == "formula")
+
     table_frac   = type_distribution.get("table_heavy", 0.0)
     image_frac   = type_distribution.get("image_heavy", 0.0)
     mixed_frac   = type_distribution.get("mixed", 0.0)
@@ -138,6 +150,7 @@ def build_doc_profile(
         vision_dependency = vision_dependency,
         complexity_score  = complexity_score,
         size_tier         = size_tier,
+        formula_count     = formula_count,
     )
 
 
@@ -147,12 +160,15 @@ def build_parse_plan(
     profile: DocProfile,
     primary_viable: bool,
     use_docling: bool = False,
+    exam_paper: bool = False,
+    poster: bool = False,
 ) -> ParsePlan:
     """
     Derive adaptive ParsePlan from DocProfile.
     Complexity adjusts the base round budget by ±1.
     Model tier is capped at "fallback" when the primary model is not viable
     (total available memory — VRAM + RAM — is less than the primary model weight).
+    exam_paper=True activates D39 exam_mode (JEE/GATE/ESE full-page math extraction).
     """
     base_rounds = _BASE_ROUNDS[profile.size_tier]
     if profile.complexity_score > 0.6:
@@ -171,11 +187,42 @@ def build_parse_plan(
         # medium / high — prefer primary; cap at fallback when total memory can't cover it
         model_tier = "primary" if primary_viable else "fallback"
 
+    from cloak.config import MATH_FORMULA_THRESHOLD, MATH_OCR_ENGINE
+    from cloak.extraction.math_ocr import is_pix2tex_available
+    use_math_ocr   = profile.formula_count >= MATH_FORMULA_THRESHOLD and is_pix2tex_available()
+    math_ocr_engine = MATH_OCR_ENGINE if use_math_ocr else "none"
+
+    # D38: slide deck detection — image_heavy + mixed > 70% AND multi-page AND text-sparse
+    image_slide_frac = (
+        profile.type_distribution.get("image_heavy", 0.0)
+        + profile.type_distribution.get("mixed", 0.0)
+    )
+    slide_mode = (
+        image_slide_frac >= 0.70
+        and profile.page_count >= 5          # not a single poster
+        and profile.size_tier in ("small", "medium")
+    )
+
+    # D39: exam_mode forces model_tier to at least "fallback" (vision required for math)
+    if exam_paper and model_tier == "none":
+        model_tier = "fallback"
+
+    # D51: poster_mode forces primary vision — flowchart transcription needs the best VLM
+    if poster and model_tier == "none":
+        model_tier = "fallback"
+    if poster and model_tier == "fallback" and primary_viable:
+        model_tier = "primary"
+
     return ParsePlan(
         model_tier        = model_tier,
         max_rounds        = max_rounds,
         judge_sample_rate = judge_sample_rate,
         use_docling       = use_docling,
+        use_math_ocr      = use_math_ocr,
+        math_ocr_engine   = math_ocr_engine,
+        slide_mode        = slide_mode,
+        exam_mode         = exam_paper,
+        poster_mode       = poster,
     )
 
 
@@ -235,6 +282,10 @@ def run_docling_pass(pdf_path: Path) -> DoclingPageMap | None:
         return None
     finally:
         gc.collect()
+
+    # D36: visual reading order — sort each page top→bottom, left→right
+    for elems in element_map.values():
+        elems.sort(key=lambda e: (e.bbox_norm[1], e.bbox_norm[0]))
 
     return element_map if element_map else None
 

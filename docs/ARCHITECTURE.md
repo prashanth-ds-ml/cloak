@@ -1,6 +1,6 @@
 ---
 type: architecture
-updated: 2026-05-16 (Session 8)
+updated: 2026-05-28 (Session 24 — pipeline redesign D47)
 ---
 
 # Architecture — cloak PDF Parser
@@ -13,7 +13,7 @@ General-purpose local PDF → structured markdown. Any document type — researc
 
 ## CLI startup flow
 
-Startup screen is shown **only** on bare `cloak` and `cloak status` — not on `parse` or `list`. See D17.
+Startup screen only on bare `cloak` and `cloak status` — not on `parse` or `list`. See D17.
 
 ```mermaid
 flowchart TD
@@ -21,21 +21,11 @@ flowchart TD
 
     B -->|"cloak (no args)"| C["run_startup_cleanup()\nshow_startup_screen(show_commands=True)\n→ hardware table · model status · command list"]
     B -->|"cloak status"| D["run_startup_cleanup()\nshow_startup_screen()\n→ hardware table · model status"]
-    B -->|"cloak list"| E["list data/markdown/ contents — exit"]
-    B -->|"cloak parse <pdf|dir>"| F["for each PDF → parse(pdf, deep_review=not no_review)"]
-    F --> G(["data/markdown/{specialty}/{stem}.md\ndata/markdown/{specialty}/{stem}_confidence.md\ndata/markdown/{specialty}/{stem}_review.md (Phase 9)\ndata/markdown/{specialty}/{stem}_images/ (regions)"])
+    B -->|"cloak list"| E["registry → table of parsed docs with scores"]
+    B -->|"cloak clean [--yes]"| CL["remove data/markdown/ output"]
+    B -->|"cloak parse <pdf|dir> [--no-review] [--dry-run]"| F["for each PDF → parse(pdf, deep_review=not no_review)"]
+    F --> G(["data/markdown/{specialty}/{stem}.md\ndata/markdown/{specialty}/{stem}_confidence.md\ndata/markdown/{specialty}/{stem}_review.md (Phase 9)\ndata/markdown/{specialty}/{stem}_flagged.md\ndata/markdown/{specialty}/{stem}_images/"])
 ```
-
-**CLI commands:**
-```
-cloak                               → startup screen (hardware + model status + command list)
-cloak parse <pdf|dir>               → parse PDF(s); no startup screen
-cloak parse <pdf|dir> --no-review   → parse without Phase 9 deep review
-cloak status                        → hardware + model status only
-cloak list                          → list parsed documents in data/markdown/
-```
-
-See [[docs/MODULES.md]] §CLI · [[docs/DECISIONS.md]] §D17
 
 ---
 
@@ -51,73 +41,115 @@ flowchart TD
 
     P0 --> P1
 
-    subgraph P1["Phase 1 · DOC INTELLIGENCE  (no model — docling layout pass)"]
-        PR1["docling layout analysis pass → element map per page\nSectionHeaderItem (level 1/2/3) · TextItem · TableItem\nFigureItem · ListItem · FootnoteItem · FormulaItem\nPageHeader/PageFooter → DISCARDED"]
-        PR1 --> PR2["aggregate → DocProfile\n(page_count · type_distribution · vision_dependency · complexity_score · size_tier)"]
-        PR2 --> PR3["generate ParsePlan\n(model_tier · max_rounds · judge_sample_rate)"]
+    subgraph P1["Phase 1 · DOC INTELLIGENCE  (no model)"]
+        PR1["docling layout pass → DoclingPageMap\nelements: SectionHeader · Text · Table · Figure\nFormula · Footnote · ListItem · Caption\nPageHeader/PageFooter → DISCARDED\nsort per page by (bbox_norm.y, bbox_norm.x) — D36"]
+        PR1 --> PR2["heuristic profile_all(pages) → RouteMap\nupdate_vision_from_docling() — refine needs_vision (D29)"]
+        PR2 --> PR2b["build ElementInventory from DoclingPageMap — D47\n{page_n: {headers, tables, figures, formulas}}\nThis is the judge's ground-truth checklist"]
+        PR2b --> PR2c["TOC detection → expected_heading_list\ncontinuation table scan → merge_pairs list"]
+        PR2c --> PR3["build_doc_profile() → DocProfile\n(page_count · type_distribution · vision_dependency\ncomplexity_score · size_tier · formula_count — D35)"]
+        PR3 --> PR4["build_parse_plan() → ParsePlan\n(model_tier · max_rounds · judge_sample_rate\nuse_docling · use_math_ocr · math_ocr_engine — D35)"]
     end
 
     P1 --> P2
 
-    subgraph P2["Phase 2 · MODEL STAGING  (from ParsePlan — D28)"]
-        M1["vision_dependency=none  → skip vision probe entirely"]
-        M2["vision_dependency=low   → load VISION_FALLBACK only"]
-        M3["vision_dependency=med/high → try VISION_PRIMARY"]
+    subgraph P2["Phase 2 · MODEL STAGING  (from ParsePlan.model_tier — D28)"]
+        M1["model_tier=none  → skip vision probe"]
+        M2["model_tier=fallback → probe qwen3-vl:4b only"]
+        M3["model_tier=primary  → probe qwen2.5vl:7b → fallback qwen3-vl:4b"]
     end
 
     P2 --> P3
 
-    subgraph P3["Phase 3 · EXTRACTION  (element-aware tool cascade — D29)"]
-        E1["SectionHeaderItem → heading at correct level ##/###/####"]
-        E2["TextItem          → pdfplumber chars (fidelity)"]
+    subgraph P3["Phase 3 · EXTRACTION  (docling path primary — D29)"]
+        E0["if docling + page not scanned → _extract_docling_page()"]
+        E1["SectionHeaderItem → ##/###/#### heading at correct level"]
+        E2["TextItem          → pdfplumber chars"]
         E3["TableItem         → pdfplumber (simple) or docling (complex)"]
         E4["FigureItem        → bbox crop → vision.region_describe() + caption"]
         E5["FootnoteItem      → collected → appended at section end"]
-        E6["Scanned page      → surya OCR → tesseract fallback (D30)"]
+        E6["FormulaItem       → pix2tex bbox crop → $$latex$$ (D35)\n                       fallback: docling text as inline code"]
+        E7["Scanned page      → surya OCR → tesseract fallback (D30)"]
+        E8["Gap A: empty docling output → pdfplumber fallback\nGap C: garbled glyphs → vision reroute"]
     end
 
-    P3 --> P4
+    P3 --> P35
 
-    subgraph P4["Phase 4 · FORMAT SESSION  (qwen3:8b — once — light cleanup)"]
-        F1["structure already correct from docling\nFORMAT: normalise table syntax · link footnotes · clean spacing\n/no_think · FORMAT_NUM_CTX=8192 · content-loss guard (D5)"]
+    subgraph P35["Phase 3.5 · STRUCTURAL MERGE  (no model — D47)"]
+        SM1["merge continuation table pairs (page N + page N+1)\ndetected in Phase 1 — one markdown table, not two fragments"]
+        SM1 --> SM2["TOC validation: expected_heading_list vs extracted headings\nmissing headings → targeted_gaps list for Phase 6"]
     end
 
-    P4 --> P5
+    P35 --> P4
 
-    subgraph P5["Phase 5 · JUDGE SESSION  (vision model — sampled — D28/D31)"]
-        J1["sample pages per ParsePlan.judge_sample_rate\nskip carryover pages (≥ 9.0)\ncontent score + structural fidelity score → PageScore"]
+    subgraph P4["Phase 4 · FORMAT SESSION  (gemma4:26b — once — D20)"]
+        F1["structure already correct from docling\nthink=False · FORMAT_NUM_CTX=32768\ncontent-loss guard (D5)"]
+    end
+
+    P4 --> P45
+
+    subgraph P45["Phase 4.5 · PRE-JUDGE INVENTORY  (no model — D47)"]
+        PJ1["ElementInventory vs extracted markdown\nexpected_tables − found_tables → missing_tables\nexpected_headings − found_headings → missing_headings\n→ pre_gaps list fed directly into Phase 6\nloop knows what is missing before round 1"]
+    end
+
+    P45 --> P5
+
+    subgraph P5["Phase 5 · JUDGE SESSION  (4-level escalating — D47)"]
+        J1["L1 — Docling Coverage: ElementInventory vs markdown\n     expected vs found per element type · deterministic"]
+        J2["L2 — Word Recall + Hallucination Rate: pdfplumber independent\n     recall = (pdfplumber ∩ md) / pdfplumber\n     hallucination = (md − pdfplumber) / md\n     hallucination > 20% → flag regardless of recall"]
+        J3["L3 — GLM-OCR Cross-check: only when L1 < 0.7 or L2 hallucination > 0.15\n     independent model · numeric/table discrepancy detection"]
+        J4["L4 — Gemma4 Constrained Judge: image_heavy/scanned/exam only\n     prompt grounded with docling checklist · think=True\n     never open-ended self-evaluation"]
+        J5["track structural signature per round:\n{heading_count, table_count, paragraph_count}"]
+        J1 --> J2 --> J3 --> J4 --> J5
     end
 
     P5 --> CHK{best_score ≥ 8.0\nor round == plan.max_rounds?}
     CHK -->|no| P6
 
-    subgraph P6["Phase 6 · PATCH SESSION  (qwen3:8b)"]
-        PA1["targeted patches for flagged pages\ncontent-loss guard (D5)"]
+    subgraph P6["Phase 6 · PATCH SESSION  (gemma4:26b — D47)"]
+        PA1["adaptive targeting: sort gaps by severity\ncritical (< 4.0) first · grouped by page proximity\nbatched agent calls — prevents context overflow"]
+        PA1 --> PA2["content-loss guard (D5)\nstructural regression check: heading/table count drop > 20% → revert"]
     end
 
     P6 --> P5
 
-    CHK -->|yes| P8
+    CHK -->|yes| P7
 
-    subgraph P8["Phase 8 · OUTPUT"]
-        O1["final.md  (best round — D2)"]
-        O2["confidence_report.md  (per-page High/Medium/Low — D24)"]
-        O3["flagged.md  (pages < 5.0 — raw source + gaps)"]
+    subgraph P7["Phase 7 · STRUCTURAL VALIDATION  (no model — D47)"]
+        SV1["final_headings vs expected_heading_list\nstill_missing = expected − final\nif still_missing AND budget exhausted:\n  ONE targeted patch for missing sections only"]
     end
 
-    P8 --> TD["model_router.teardown_pdf()\nall pipeline models unloaded"]
+    P7 --> P8
+
+    subgraph P8["Phase 8 · WRITE FROM STAGING"]
+        O1["assemble from staging file + best_round.markdown"]
+    end
+
+    P8 --> P85
+
+    subgraph P85["Phase 8.5 · POST-PROCESS  (deterministic — D47)"]
+        PP1["strip_html_comments()     ← processing artifacts G1"]
+        PP2["clean_latex_encoding()    ← non-ASCII inside $$...$$ G3"]
+        PP3["strip_exam_headers()      ← GATE/IISc/Page X of Y G2"]
+        PP4["strip_think_artifacts()   ← /think fragments"]
+        PP5["deduplicate_lines()       ← consecutive identical lines"]
+        PP6["validate_table_columns()  ← consistent column counts"]
+        PP7["add_page_markers()        ← <!-- page N --> between pages"]
+        PP8["normalize_whitespace()    ← multiple blank lines → single"]
+        PP1 --> PP2 --> PP3 --> PP4 --> PP5 --> PP6 --> PP7 --> PP8
+        PP8 --> OUT["write clean final.md\nconfidence_report.md (cites L1/L2/L3/L4 per page)\nflagged.md · images/"]
+    end
+
+    P85 --> TD["model_router.teardown_pdf()\nall pipeline models unloaded"]
     TD --> P9
 
-    subgraph P9["Phase 9 · DEEP REVIEW  (gemma4:latest — CPU+GPU split — D27)"]
-        DR1["compare raw pdfplumber text vs final.md\nwrite {stem}_review.md\nunload gemma4 when done"]
+    subgraph P9["Phase 9 · DEEP REVIEW  (gemma4:26b — D27, updated D47)"]
+        DR1["input: pdfplumber text + ElementInventory + L1/L2/L3 judge findings\ngrounded prompt: 'docling found X tables — Y appear in markdown'\nverifies specific claims, not open-ended self-review\nwrite {stem}_review.md"]
     end
 ```
 
 ---
 
-## Phase-based model routing (D14)
-
-Each quality round (Phases 5–6) splits into two hard phases. Models managed at phase boundary — never mid-round. With `qwen3-vl:4b` as fallback (Session 8), both vision models coexist freely with `qwen3:8b` — phase boundaries are still called structurally but are no-ops for all current model pairings.
+## Phase-based model routing (D14, D37)
 
 ```mermaid
 sequenceDiagram
@@ -125,21 +157,21 @@ sequenceDiagram
     participant R as model_router
     participant V1 as qwen2.5vl:7b
     participant V2 as qwen3-vl:4b
-    participant O as qwen3:8b
+    participant O as qwen3.6:27b
 
     A->>R: reset()
-    Note over A,O: Phase 3 — vision extraction for all page types
+    Note over A,O: Phase 3 — docling extraction; vision only for FigureItems + image/mixed pages
     A->>R: before_vision_phase()
-    A->>V1: full_page_extract() for ALL pages (or V2 if sticky)
-    A->>R: before_orchestrator_phase()
+    A->>V1: region_describe() for FigureItems (or V2 if sticky)
+    A->>R: before_orchestrator_phase() [only if needs_fmt=True — D37]
     A->>O: Phase 4 FORMAT session
 
-    loop Rounds 1..MAX_ROUNDS (Phases 5–6)
-        Note over A,O: Phase 5 — judge every page
+    loop Rounds 1..ParsePlan.max_rounds (Phases 5–6)
+        Note over A,O: Phase 5 — judge: heuristic (text) or vision (image/scanned)
         A->>R: before_vision_phase()
-        A->>V1: judge_quality() per page [or V2 if sticky]
+        A->>V1: judge_quality() for image/scanned pages (or V2 if sticky)
         A->>R: before_orchestrator_phase()
-        A->>O: Phase 6 PATCH session (fill gaps)
+        A->>O: Phase 6 PATCH session
     end
 
     A->>R: teardown_pdf()
@@ -150,33 +182,30 @@ sequenceDiagram
 
 ---
 
-## VRAM budget by phase
-
-Session 8: all three pipeline models fit in 8 GB VRAM simultaneously. No coexistence conflicts.
+## VRAM budget by phase (RTX 5050, 8 GB VRAM + 24 GB RAM)
 
 | Phase | qwen2.5vl:7b sticky | qwen3-vl:4b sticky |
 |---|---|---|
-| **Phase 3 EXTRACT** (all page types) | V1 ~7.3 GB GPU · O ~5.2 GB GPU (coexist) | V2 ~3.5 GB GPU · O ~5.2 GB GPU (coexist) |
-| **Phase 4 FORMAT** | O ~5.2 GB GPU | O ~5.2 GB GPU |
-| **Phase 5 JUDGE** | V1 ~7.3 GB GPU · O ~5.2 GB GPU (coexist) | V2 ~3.5 GB GPU · O ~5.2 GB GPU (coexist) |
-| **Phase 6 PATCH** | O ~5.2 GB GPU | O ~5.2 GB GPU |
+| **Phase 3 EXTRACT** | V1 ~7.3 GB GPU · O ~17 GB CPU+GPU (Ollama manages split) | V2 ~3.5 GB GPU · O ~17 GB CPU+GPU |
+| **Phase 4 FORMAT** | O ~17 GB CPU+GPU | O ~17 GB CPU+GPU |
+| **Phase 5 JUDGE** | V1 ~7.3 GB GPU · O ~17 GB CPU+GPU | V2 ~3.5 GB GPU · O ~17 GB CPU+GPU |
+| **Phase 6 PATCH** | O ~17 GB CPU+GPU | O ~17 GB CPU+GPU |
 | **Teardown** | V1 unloaded | V2 unloaded |
-| **Phase 9 REVIEW** | gemma4 ~9.6 GB CPU+GPU split (after teardown, no pipeline models loaded) | same |
-
-Hardware envelope: RTX 5050 8 GB VRAM + 24 GB RAM. See [[docs/MODELS.md]] §VRAM observations.
+| **Phase 9 REVIEW** | gemma4 ~9.6 GB CPU+GPU split (after teardown) | same |
 
 ---
 
-## Model routing decision tree (D28 — DocProfile-driven)
+## DocProfile-driven model routing (D28)
 
 ```mermaid
 flowchart TD
-    A([PDF start]) --> DP["Phase 1: DocProfile computed\n(zero model — docling layout pass)"]
-    DP --> VD{vision_dependency?}
+    A([PDF start]) --> DP["Phase 1: DocProfile computed\n(zero model calls)"]
+    DP --> FMT["formula_count ≥ 3 + pix2tex available?\n→ ParsePlan.use_math_ocr=True (D35)"]
+    FMT --> VD{vision_dependency?}
 
-    VD -->|none — < 5% visual pages| NA["skip vision probe\ndocling + pdfplumber + surya only\nno quality loop judge (no vision available)"]
-    VD -->|low — 5–20%| LO["probe VISION_FALLBACK only\nqwen3-vl:4b — 30s timeout"]
-    VD -->|medium / high| ME["probe VISION_PRIMARY first\nqwen2.5vl:7b → fallback qwen3-vl:4b"]
+    VD -->|none — < 5% visual pages| NA["skip vision probe\ndocling + pdfplumber + surya + pix2tex only"]
+    VD -->|low — 5–20%| LO["probe qwen3-vl:4b only\n30s timeout"]
+    VD -->|medium / high| ME["probe qwen2.5vl:7b → fallback qwen3-vl:4b"]
 
     LO --> LR{loads?}
     LR -->|yes| G(["sticky = qwen3-vl:4b"])
@@ -184,90 +213,91 @@ flowchart TD
 
     ME --> MR{primary loads?}
     MR -->|yes| D(["sticky = qwen2.5vl:7b"])
-    MR -->|no| E["probe VISION_FALLBACK\nqwen3-vl:4b"]
+    MR -->|no| E["probe qwen3-vl:4b"]
     E --> FR{loads?}
     FR -->|yes| G
     FR -->|no| NA
-
-    D --> I["Phase 3: FigureItem crops → qwen2.5vl:7b\nPhase 5 judge → qwen2.5vl:7b (sampled — ParsePlan)\nPhase 6 patch → qwen3:8b"]
-    G --> J["Phase 3: FigureItem crops → qwen3-vl:4b\nPhase 5 judge → qwen3-vl:4b (sampled)\nPhase 6 patch → qwen3:8b"]
-    NA --> K["All pages: docling structure + pdfplumber + surya OCR\nPhase 9 still runs (pdfplumber text available)"]
 ```
 
 ---
 
 ## Extract strategy per page type (Phase 3)
 
-Routing is set by the profiler (Phase 1). Session 8: text_rich pages now use vision for heading extraction (D23 updated).
+The docling path is the primary route for all non-scanned pages. Legacy vision-only routes used only when docling is unavailable.
 
 ```mermaid
 flowchart LR
-    A([page N]) --> B{vision\navailable?}
+    A([page N]) --> DC{DoclingPageMap\navailable?}
 
-    B -->|yes| C{RouteMap\nstrategy?}
-    B -->|no| D{RouteMap\nstrategy?}
+    DC -->|yes + not scanned| DOC["_extract_docling_page()\n→ heading hierarchy from SectionHeaderItems\n→ pdfplumber text for TextItems\n→ vision crop for FigureItems\n→ pix2tex crop for FormulaItems (D35)\n→ footnotes at section end"]
+    DC -->|no or scanned| B{RouteMap + vision?}
 
-    C -->|text_rich| E["_extract_text_page_vision()\nfull_page_extract → headings from layout\n+ pdfplumber tables appended"]
-    C -->|table_heavy| F["_extract_table_page()\npdfplumber tables + PyMuPDF text"]
-    C -->|scanned| G["_extract_scanned_page()\nTesseract OCR"]
-    C -->|image_heavy| H["_extract_vision_page()\nfull_page_extract + region_describe\ncrops saved to images_dir"]
-    C -->|mixed| I["_extract_mixed_page()\nfull_page_extract + region_describe\ncrops saved to images_dir"]
+    B -->|scanned| G["_extract_scanned_page()\nsurya OCR → tesseract fallback"]
+    B -->|image_heavy + vision| H["_extract_vision_page()"]
+    B -->|mixed + vision| I["_extract_mixed_page()"]
+    B -->|text_rich/table_heavy| J["_extract_text_page()"]
 
-    D -->|text_rich/table_heavy| J["_extract_text_page()\npdfplumber flat text + tables"]
-    D -->|scanned| G
-    D -->|image_heavy/mixed| K["_extract_text_page()\npdfplumber only (no vision available)"]
+    DOC --> FallbackA["Gap A: empty → _extract_text_page()"]
+    DOC --> FallbackC["Gap C: garbled → _extract_vision_page()"]
 
-    E --> L([raw_content[N]])
-    F --> L
+    DOC --> L([raw_content[N]])
+    FallbackA --> L
+    FallbackC --> L
     G --> L
     H --> L
     I --> L
     J --> L
-    K --> L
 ```
 
 ---
 
-## Quality loop — pseudocode (9-phase pipeline)
-
-Reflects D14 (phase-based), D19 (extract once), D20 (FORMAT before PATCH), D21 (profiler routes extraction), D23 (vision for all page types), D27 (Phase 9 deep review).
+## Quality loop — pseudocode
 
 ```python
 # Phase 0 — Intake
 pages = pdf_tools.load_pages(pdf_path)
-output_dir = create_output_dir(pdf_path)
 images_dir = _images_dir(out_path)
 
-# Phase 1 — Page profiler
+# Phase 1 — Doc intelligence
+element_map = run_docling_pass(pdf_path)           # None if docling fails
 page_profiles = page_profiler.profile_all(pages)
 route_map = page_profiler.build_route_map(page_profiles)
+if element_map:
+    update_vision_from_docling(page_profiles, element_map)   # D29
+doc_profile = build_doc_profile(page_profiles, element_map) # formula_count — D35
+plan = build_parse_plan(doc_profile, primary_viable, use_docling=element_map is not None)
+model_router.set_parse_plan(plan)
 
-# Phase 2 — Routing (implicit in route_map)
+# Phase 2 — Staging
+vision_available = _probe_vision()   # respects plan.model_tier
 
-# Phase 3 — Vision extraction for all page types (D23 updated)
-model_router.reset()
-_vision_available = _probe_vision()
-
+# Phase 3 — Extraction (docling path primary)
 model_router.before_vision_phase()
-raw_content = _extract_by_route(pages, route_map, images_dir=images_dir)
-    # text_rich: _extract_text_page_vision() — headings from visual layout
-    # image_heavy/mixed: vision + region_describe + save crops
-    # table_heavy: pdfplumber; scanned: Tesseract
-model_router.before_orchestrator_phase()
+raw_content = _extract_by_route(pages, route_map, vision_available,
+                                images_dir=images_dir,
+                                element_map=element_map,
+                                use_math_ocr=plan.use_math_ocr)  # D35
+_clean_output_artifacts(raw_content)   # leader dots, watermarks
 
-# Phase 4 — Format (once) — qwen3:8b with /no_think, FORMAT_NUM_CTX=8192
-formatted_md = _run_format_session(raw_content)
-if _content_loss_ok(raw_content, formatted_md):        # D5
-    current_md = formatted_md
+# Phase 4 — Format (once) — D20
+if needs_fmt:
+    model_router.before_orchestrator_phase()   # D37: only when format runs
+    formatted_md = _run_format_session(raw_content)
+    if _content_loss_ok(raw_content, formatted_md):
+        current_md = formatted_md
 
 best = RoundResult(score=0.0)
 
-for round_num in 1..MAX_ROUNDS:
+for round_num in 1..plan.max_rounds:
 
-    # Phase 5 — Judge (per page, every round)
+    # Phase 5 — Judge (per-page routing — D33)
     model_router.before_vision_phase()
-    page_scores = [quality_judge.judge(pg.image, current_md, round_num,
-                       model=model_router.get_vision_model()) for pg in pages]
+    page_scores = []
+    for pg in sampled_pages(plan.judge_sample_rate):
+        if needs_vision_map[pg.page_num]:
+            score = quality_judge.judge(pg.image, current_md, round_num, model)
+        else:
+            score = heuristic_judge(pg.page_num, current_md, pg.text)
     avg_score, all_gaps = aggregate(page_scores)
 
     if avg_score > best.score:
@@ -275,27 +305,83 @@ for round_num in 1..MAX_ROUNDS:
 
     if best.score >= QUALITY_THRESHOLD:   # D3
         break
-    if round_num == MAX_ROUNDS:
-        break
 
     # Phase 6 — Patch
     model_router.before_orchestrator_phase()
     messages = context_manager.compress_history(messages)   # D6
-    updated = _run_patch_loop(pages, current_md, all_gaps, messages, images_dir=images_dir)
+    updated = _run_patch_loop(pages, current_md, all_gaps, messages, images_dir)
     if _content_loss_ok(current_md, updated):               # D5
         current_md = updated
 
 # Phase 8 — Output
-write(best.markdown, output_dir / f"{stem}.md")                              # D2
-write(_build_confidence_report(best.page_scores, pdf_name),
-      output_dir / f"{stem}_confidence.md")                                  # D24
+write(best.markdown, out_path)                                        # D2
+write(_build_confidence_report(best.page_scores), confidence_path)   # D24
+write(_build_flagged(best.page_scores), flagged_path)
 model_router.teardown_pdf()
 
-# Phase 9 — Deep review (after all pipeline models unloaded)
+# Phase 9 — Deep review
 if deep_review:
-    rev_path = deep_review.run(pdf_path, pages, best.markdown,
-                               review_out=out_path.with_name(f"{stem}_review.md"),
-                               console=console)                               # D27
+    deep_review.run(pdf_path, pages, best.markdown, review_path)      # D27
+```
+
+---
+
+## Key data types
+
+```python
+# profiling/page_profiler.py
+@dataclass
+class PageProfile:
+    page_num: int
+    text_length: int
+    image_area_ratio: float
+    table_count: int
+    page_type: str      # "text_rich" | "table_heavy" | "image_heavy" | "scanned" | "mixed"
+    needs_ocr: bool
+    needs_vision: bool  # refined by update_vision_from_docling()
+
+RouteMap = dict[int, str]   # page_num → page_type
+
+# profiling/doc_profiler.py
+@dataclass
+class DocProfile:
+    page_count:        int
+    type_distribution: dict[str, float]
+    vision_dependency: str    # "none" | "low" | "medium" | "high"
+    complexity_score:  float  # 0.0–1.0
+    size_tier:         str    # "small" | "medium" | "large" | "huge"
+    formula_count:     int    # D35: FormulaItem count from docling
+
+@dataclass
+class ParsePlan:
+    model_tier:        str    # "none" | "fallback" | "primary"
+    max_rounds:        int
+    judge_sample_rate: float
+    use_docling:       bool
+    use_math_ocr:      bool   # D35
+    math_ocr_engine:   str    # D35: "pix2tex" | "none"
+
+DoclingElement = dataclass(label, text, level, bbox_norm, table_md, caption)
+DoclingPageMap = dict[int, list[DoclingElement]]   # {page_num_0indexed: [elements]}
+
+# quality/quality_judge.py
+@dataclass
+class PageScore:
+    page_num:      int
+    score:         float   # 0.7×content + 0.3×structure
+    confidence:    str     # "High" | "Medium" | "Low"
+    gaps:          list[str]
+    action:        str     # "accept" | "patch" | "fallback"
+    round_num:     int
+    model:         str
+
+@dataclass
+class RoundResult:
+    round_num:   int
+    markdown:    str
+    score:       float
+    page_scores: list[PageScore]
+    gaps:        list[str]
 ```
 
 ---
@@ -310,8 +396,11 @@ flowchart TD
     config --> context_manager
     config --> ocr_tools
     config --> deep_review
+    config --> math_ocr
 
     pdf_tools --> page_profiler
+    page_profiler --> doc_profiler
+    doc_profiler --> parser_agent
     page_profiler --> parser_agent
 
     config --> system_check
@@ -320,6 +409,7 @@ flowchart TD
     model_router --> parser_agent
     pdf_tools --> parser_agent
     ocr_tools --> parser_agent
+    math_ocr --> parser_agent
     vision_tools --> parser_agent
     vision_tools --> quality_judge
     quality_judge --> parser_agent
@@ -327,123 +417,38 @@ flowchart TD
     deep_review --> parser_agent
 
     cli --> parser_agent
-    parser_agent --> output[/"data/markdown/…/final.md\ndata/markdown/…/confidence_report.md\ndata/markdown/…/review.md\ndata/markdown/…/{stem}_images/"/]
+    parser_agent --> output[/"data/markdown/…/final.md\nconfidence_report.md · review.md · flagged.md · images/"/]
 ```
 
 ---
 
-## Key data types
-
-```python
-# profiling/page_profiler.py — unchanged
-@dataclass
-class PageProfile:
-    page_num: int
-    text_length: int          # chars from PyMuPDF / docling
-    image_area_ratio: float   # image bbox area / page area
-    table_count: int          # tables found on this page
-    page_type: str            # "text_rich" | "table_heavy" | "image_heavy" | "scanned" | "mixed"
-    needs_ocr: bool
-    needs_vision: bool
-
-RouteMap = dict[int, str]     # page_num → page_type string
-
-# profiling/doc_profiler.py — NEW (D28)
-@dataclass
-class DocProfile:
-    page_count:         int
-    type_distribution:  dict[str, float]   # {"text_rich": 0.82, "image_heavy": 0.12, ...}
-    vision_dependency:  str                # "none" | "low" | "medium" | "high"
-    complexity_score:   float              # 0.0–1.0
-    size_tier:          str                # "small" | "medium" | "large" | "huge"
-
-@dataclass
-class ParsePlan:
-    model_tier:         str                # "none" | "fallback" | "primary"
-    max_rounds:         int                # adaptive from size_tier + complexity_score
-    judge_sample_rate:  float              # 0.1–1.0 — fraction of pages judged per round
-    use_docling:        bool               # True when docling installed
-
-# quality/quality_judge.py — updated (D31)
-@dataclass
-class PageScore:
-    page_num:        int
-    score:           float    # combined: 0.7*content + 0.3*structure
-    content_score:   float    # completeness vs source image
-    structure_score: float    # heading hierarchy · table completeness · caption linking
-    confidence:      str      # "High" (≥8.0) | "Medium" (≥5.0) | "Low" (<5.0)
-    gaps:            list[str]
-    action:          str      # "accept" | "patch" | "fallback"
-    round_num:       int
-    model:           str
-
-# parser_agent.py — internal tracking (unchanged)
-@dataclass
-class RoundResult:
-    round_num: int
-    markdown: str
-    score: float
-    page_scores: list[PageScore]
-    gaps: list[str]
-
-# pdf_tools.py — unchanged
-@dataclass
-class PageData:
-    page_num: int
-    image: PIL.Image
-    width: float
-    height: float
-    blocks: list[Block]
-    regions: list[RegionCrop]
-    tables: list[TableData]
-```
-
----
-
-## File I/O
-
-| Input | Path |
-|---|---|
-| Source PDFs | `data/raw/{specialty}/{condition}.pdf` |
-| Output markdown | `data/markdown/{specialty}/{condition}.md` |
-| Output confidence report | `data/markdown/{specialty}/{stem}_confidence.md` |
-| Output deep review | `data/markdown/{specialty}/{stem}_review.md` (Phase 9, optional) |
-| Region crop images | `data/markdown/{specialty}/{stem}_images/page_{n}_{label}_{i}.png` |
-| Page images | In-memory (PIL) — not written to disk |
-
----
-
-## Folder structure (updated Session 9 — D28/D29)
+## Folder structure
 
 ```
 cloak/
 ├── __init__.py
 ├── config.py
+├── registry.py              ← document registry (cloak list)
 ├── cli/
-│   ├── __init__.py
-│   ├── main.py              ← typer CLI (startup screen only on bare cloak + status)
-│   └── system_check.py      ← VRAM-aware hardware probe + startup memory cleanup
+│   ├── main.py              ← typer CLI
+│   └── system_check.py      ← VRAM-aware hardware probe + startup cleanup
 ├── profiling/
-│   ├── __init__.py
 │   ├── page_profiler.py     ← heuristic page classification + RouteMap (D21)
-│   └── doc_profiler.py      ← DocProfile + ParsePlan (D28) [planned]
+│   └── doc_profiler.py      ← DocProfile + ParsePlan (D28, D35)
 ├── extraction/
-│   ├── __init__.py
 │   ├── pdf_tools.py         ← PDF → PageData; region crop detection
-│   └── ocr_tools.py         ← Surya primary OCR + Tesseract fallback (D30)
+│   ├── ocr_tools.py         ← Surya primary OCR + Tesseract fallback (D30)
+│   └── math_ocr.py          ← pix2tex FormulaItem OCR (D35)
 ├── vision/
-│   ├── __init__.py
-│   └── vision_tools.py      ← region_describe, judge_quality (narrowed — D29)
+│   └── vision_tools.py      ← region_describe, judge_quality (D29, D34)
 ├── quality/
-│   ├── __init__.py
-│   ├── quality_judge.py     ← PageScore with content + structural fidelity (D31)
-│   └── deep_review.py       ← Phase 9: gemma4:latest post-pipeline review
+│   ├── quality_judge.py     ← PageScore, heuristic_judge (D31, D33)
+│   └── deep_review.py       ← Phase 9: gemma4:latest post-pipeline review (D27)
 ├── orchestration/
-│   ├── __init__.py
-│   ├── model_router.py      ← DocProfile-driven model tier selection (D28)
-│   ├── context_manager.py   ← history compression
-│   └── parser_agent.py      ← 9-phase orchestrator with ParsePlan wiring
-└── ingestion/               ← legacy read-only files only
+│   ├── model_router.py      ← ParsePlan-driven model tier selection (D28, D37)
+│   ├── context_manager.py   ← history compression (D6)
+│   └── parser_agent.py      ← 9-phase orchestrator (D14 + D19 + D20 + D28–D37)
+└── ingestion/               ← legacy read-only files
     ├── pdf_extractor.py
     ├── pdf_classifier.py
     ├── vision.py
@@ -456,11 +461,12 @@ cloak/
 
 | Resource | Budget | Notes |
 |---|---|---|
-| GPU VRAM | 8 GB (RTX 5050) | qwen2.5vl:7b (7.3 GB) + qwen3:8b (5.2 GB) — may spill ~4 GB to RAM |
-| RAM | 24 GB | gemma4:latest (9.6 GB) used in Phase 9 via CPU+GPU split |
+| GPU VRAM | 8 GB (RTX 5050) | qwen2.5vl:7b fills GPU; qwen3.6:27b spills to RAM |
+| RAM | 24 GB | qwen3.6:27b ~9 GB RAM; gemma4 ~1.6 GB RAM (Phase 9 after teardown) |
 | Phase rule | One model family at a time | enforced by before_vision_phase / before_orchestrator_phase |
-| Max tokens per round | 8K | enforced by context_manager |
-| Format context | 8192 tokens | FORMAT_NUM_CTX — larger to handle vision output + thinking tokens |
-| Image long edge | 1024px | enforced by vision_tools._prepare_image |
-| Min free RAM to start | 9 GB | checked by system_check.ram_gate() — see [[docs/DECISIONS.md]] §D18 |
-| Phase 9 memory | loaded after teardown | gemma4 requires all pipeline models unloaded first |
+| Max tokens per round | 16K | MODEL_NUM_CTX = 16384 |
+| Format context | 32K tokens | FORMAT_NUM_CTX = 32768 |
+| Image long edge | 1024px | extract + region_describe (MAX_IMAGE_PX) |
+| Judge image long edge | 512px | JUDGE_MAX_IMAGE_PX — reduces visual tokens ~4× |
+| Min free RAM to start | 9 GB | system_check.ram_gate() — D18 |
+| Phase 9 memory | after teardown only | gemma4 requires all pipeline models unloaded |

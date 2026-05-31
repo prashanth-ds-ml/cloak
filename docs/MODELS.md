@@ -1,6 +1,6 @@
 ---
 type: model-reference
-updated: 2026-05-20 (Session 11)
+updated: 2026-05-31 (Session 26)
 ---
 
 # Model Reference — cloak
@@ -11,80 +11,42 @@ All models run locally via Ollama. No cloud API calls.
 
 ---
 
-## Model roster
+## Model roster (Session 26 — D49)
 
-| Model | Role | VRAM | Timeout |
+| Model | Role | Size | Timeout |
 |---|---|---|---|
-| `qwen3:8b` | Orchestrator — format, patch, tool-calling, context summarise | ~5.2 GB | 150s |
-| `qwen2.5vl:7b` | Vision primary — OCR, layout, quality judge | ~7.3 GB | 400s |
-| `qwen3-vl:4b` | Vision fallback — same VL family, fits fully in GPU (replaced llama3.2-vision, D15) | ~3.5 GB | 400s |
-| `gemma4:latest` | Phase 9 deep review only — CPU+GPU split after pipeline teardown | ~9.6 GB (GPU+RAM) | 600s |
-| `mistral:7b` | Available locally but **not used** in parser | — | — |
+| `qwen3-vl:8b` | Vision LLM — figure crops, image pages, L4 judge | 6.1 GB (GPU) | VISION_TIMEOUT=1800s |
+| `qwen3-vl:4b` | Vision fallback — probed if 8b fails to load | 3.3 GB (GPU) | VISION_TIMEOUT=1800s |
+| `qwen3:14b` | Text LLM — FORMAT, PATCH, deep review | 9.0 GB (GPU+RAM) | AGENT_TIMEOUT=600s / FORMAT_TIMEOUT=900s |
+| `glm-ocr` | Scanned OCR + L3 cross-check — always-resident | 2.2 GB (GPU or RAM) | GLM_OCR_TIMEOUT=60s |
+| `pix2tex` (LatexOCR) | Math OCR — FormulaItem bbox crops → LaTeX | ~100 MB (CPU) | MATH_OCR_TIMEOUT=30s |
 
 ---
 
-## Model suitability table (D18/D32, updated Session 11)
+## VRAM budget by phase (RTX 5050, 8 GB VRAM + 24 GB RAM)
 
-Checked at startup via `system_check.check_model_suitability()`. Confirmed on RTX 5050 8 GB VRAM / 24 GB RAM.
-Viability = `free_vram + free_ram >= model_weight` (total-memory pool — D32).
+VLM and LLM are mutually exclusive in VRAM — loading both simultaneously would be 15.1 GB, forcing LLM entirely to slow RAM. Phase boundaries use `unload_and_wait()` (D50).
 
-| Model | Weight | Status on RTX 5050 | Display |
+| Phase | Models active | VRAM | RAM |
 |---|---|---|---|
-| `qwen2.5vl:7b` | ~7.3 GB | fully in VRAM when ≥ 7.3 GB free | **ready (GPU)** — green |
-| `qwen2.5vl:7b` | ~7.3 GB | ~7.0 GB VRAM + ~0.3 GB RAM | **ready (auto-split)** — cyan |
-| `qwen3:8b` | ~5.2 GB | fully in VRAM | **ready (GPU)** — green |
-| `qwen3-vl:4b` | ~3.5 GB | fully in VRAM | **ready (GPU)** — green |
-| `gemma4:latest` | ~9.6 GB | after teardown: ~8 GB GPU + ~1.6 GB RAM | **ready (auto-split)** — cyan |
-
-`MIN_FREE_RAM_GB = 9.0` in `config.py` — minimum free RAM gate shown in startup warning.
+| Phase 3 scanned pages | glm-ocr 2.2 GB | 2.2 GB | — |
+| Phase 3 figure crops / image pages | qwen3-vl:8b 6.1 GB + glm-ocr 2.2 GB | 8.0 GB | 0.3 GB spill |
+| Phase 4 FORMAT | qwen3:14b 9.0 GB + glm-ocr 2.2 GB | 8.0 GB | 3.2 GB |
+| Phase 5 L4 judge (image pages) | qwen3-vl:8b 6.1 GB + glm-ocr 2.2 GB | 8.0 GB | 0.3 GB spill |
+| Phase 6 PATCH | qwen3:14b 9.0 GB + glm-ocr 2.2 GB | 8.0 GB | 3.2 GB |
+| Phase 9 deep review | qwen3:14b (reuse — already loaded from Phase 6) | 8.0 GB | 1.0 GB |
+| Peak at any point | ~11.2 GB across GPU+RAM | — | — |
 
 ---
 
-## VRAM observations (RTX 5050, 8 GB VRAM, 24 GB RAM)
+## Model suitability (RTX 5050, confirmed Session 26)
 
-```
-qwen2.5vl:7b   — ~7.3 GB VRAM (vision encoder makes it larger than base 7B).
-                  Needs ≥ 9 GB free RAM at startup. Close Chrome/heavy apps first.
-                  VISION_TIMEOUT = 400s — gives slow GPU time to complete.
-                  Confirmed: shows "ready (GPU)" on startup screen when ≥ 9 GB free.
-
-qwen3:8b       — ~5.2 GB VRAM. Works fine. Coexists with qwen2.5vl:7b.
-
-qwen3-vl:4b    — ~3.5 GB VRAM. Loads fully on GPU. Same VL family as qwen2.5vl.
-                  Replaces llama3.2-vision:11b as VISION_FALLBACK (Session 8, D15).
-                  All three pipeline models fit in 8 GB VRAM simultaneously.
-
-llama3.2-vision:11b — (historical) loaded at 11 GB: 58% GPU + 42% CPU RAM.
-                       Timed out on full-page OCR at 400s. Removed as fallback.
-                       Replaced by qwen3-vl:4b.
-
-gemma4:latest  — 9.6 GB. Used only for Phase 9 deep review after teardown.
-                  Ollama auto-places across GPU VRAM + CPU RAM (CPU+GPU split).
-                  DEEP_REVIEW_TIMEOUT = 600s — slower on split.
-```
-
-### Loading rules enforced by `model_router.py` (Session 11)
-
-1. `_probe_vision()` runs at start of each PDF — tries VISION_PRIMARY then VISION_FALLBACK (respects ParsePlan.model_tier via `vision_models_to_try()`).
-2. Whichever model passes the probe is set as the **sticky model** for the whole PDF via `mark_success()`.
-3. `before_vision_phase()` — always unloads orchestrator before the vision phase. Frees GPU layers for the vision model's auto-split.
-4. `before_orchestrator_phase()` — always unloads the sticky vision model before the orchestrator phase. Sticky model is remembered (not reset) for the next vision phase.
-5. `teardown_pdf()` — at end of each PDF: unloads vision model, resets sticky state + ParsePlan.
-6. **Sticky model:** once a vision model succeeds, all calls reuse it for that PDF. No repeated probe churn.
-7. **`keep_alive=-1`** — models stay loaded indefinitely within a phase; unloads only fire at explicit phase boundaries.
-
----
-
-## Ollama config applied to every call
-
-| Parameter | Value | Config key | Effect |
+| Model | Weight | Placement | Display |
 |---|---|---|---|
-| `num_ctx` | 4096 | `MODEL_NUM_CTX` | Smaller KV cache → less RAM |
-| `num_ctx` (FORMAT only) | 8192 | `FORMAT_NUM_CTX` | Larger context for Phase 4 — prevents qwen3 thinking tokens truncating output |
-| `keep_alive` | -1 | `MODEL_KEEP_ALIVE` | Model stays loaded until explicit phase-boundary unload (D11) |
-| `temperature` | 0.1 | hardcoded | Deterministic extraction |
-
-> `MODEL_KEEP_ALIVE = -1` (Session 11) keeps models loaded within a phase — no cold reloads per judge call. Explicit phase-boundary unloads (`before_vision_phase` / `before_orchestrator_phase`) still fire via `model_router.unload()` which forces immediate release regardless of session keep_alive. See D11.
+| `qwen3-vl:8b` | 6.1 GB | Full GPU (8 GB VRAM) | **ready (GPU)** — green |
+| `qwen3-vl:4b` | 3.3 GB | Full GPU | **ready (GPU)** — green |
+| `qwen3:14b` | 9.0 GB | ~8 GB VRAM + ~1 GB RAM | **ready (auto-split)** — cyan |
+| `glm-ocr` | 2.2 GB | GPU when alone; RAM when alongside VLM | **ready (GPU/RAM)** — green/cyan |
 
 ---
 
@@ -92,83 +54,72 @@ gemma4:latest  — 9.6 GB. Used only for Phase 9 deep review after teardown.
 
 | Task | Model | Fallback |
 |---|---|---|
-| Tool-calling / format / patch | `qwen3:8b` | none — skip round gracefully |
-| Full-page extraction (round 1 only) | probe winner: `qwen2.5vl:7b` or `qwen3-vl:4b` | pdfplumber/OCR text |
-| Region description (ECG, diagram) | sticky vision model | raw text placeholder |
-| Quality judge (all rounds) | sticky vision model | score=5.0 (neutral) |
-| Context summarisation | `qwen3:8b` | `"[Summary unavailable]"` |
-| Phase 9 deep review | `gemma4:latest` | skipped (returns None, prints warning) |
+| Figure description / image pages | `qwen3-vl:8b` (or fallback 4b) | caption placeholder |
+| Poster/flowchart full-page (D51) | `qwen3-vl:8b` | pdfplumber text |
+| Quality judge L4 (image/scanned pages) | `qwen3-vl:8b` (or fallback 4b) | score=5.0 neutral |
+| FORMAT cleanup (Phase 4) | `qwen3:14b` | raw content unchanged |
+| PATCH gap-filling (Phase 6) | `qwen3:14b` | skip round |
+| Deep review (Phase 9) | `qwen3:14b` (reused, no reload) | skipped |
+| Context summarisation | `qwen3:14b` | `"[Summary unavailable]"` |
+| Scanned page OCR | `glm-ocr` → `surya` → `tesseract` | raw PyMuPDF text |
+| L3 cross-check judge | `glm-ocr` | skip L3 |
+| Math formula OCR | `pix2tex` (inline Python, not Ollama) | docling text as inline code |
 
 ---
 
-## Ollama API calls used
+## Phase boundary loading rules (D49, D50)
 
-| Operation | Method | Notes |
+1. `before_vision_phase()` — if LLM (`qwen3:14b`) is loaded: `unload_and_wait()` → VLM loads lazily on first call.
+2. `before_orchestrator_phase()` — if VLM is loaded: `unload_and_wait()` → LLM loads lazily on first call.
+3. `unload_and_wait(model, timeout=30)` — POSTs `keep_alive=0`, then polls `/api/ps` until model disappears, then waits 0.5s for CUDA allocator. Falls through on timeout with a warning.
+4. `teardown_pdf()` — called AFTER Phase 9. Unloads VLM → LLM → glm-ocr in order, each confirmed.
+5. `keep_alive=-1` on all calls — model stays loaded until explicit phase-boundary unload.
+
+---
+
+## Ollama config applied to every call
+
+| Parameter | Value | Config key | Effect |
+|---|---|---|---|
+| `num_ctx` (LLM standard) | 16384 | `MODEL_NUM_CTX` | qwen3:14b patch/review context |
+| `num_ctx` (FORMAT) | 32768 | `FORMAT_NUM_CTX` | Full-doc FORMAT pass |
+| `num_ctx` (vision) | 8192 | `VISION_NUM_CTX` | VLM calls — KV cache sized for images |
+| `num_ctx` (deep review) | 8192 | `DEEP_REVIEW_NUM_CTX` | template + 10K raw + 10K md |
+| `keep_alive` | -1 | `MODEL_KEEP_ALIVE` | Model stays loaded until explicit unload |
+| `temperature` | 0.1 | hardcoded | Deterministic extraction |
+| `think` | True/False | per-call | qwen3 and gemma4 families |
+
+---
+
+## think mode by phase
+
+| Phase / call | think | Reason |
 |---|---|---|
-| Chat / tool-calling | `ollama.chat()` | Python client |
-| Vision call (image) | `ollama.chat()` with `images=` | PNG bytes, resized to ≤ `MAX_IMAGE_PX` |
-| Check installed models | GET `/api/tags` | used by `system_check.get_installed_models()` |
-| Check loaded models | GET `/api/ps` | used by `model_router.loaded_models()` |
-| Unload model | POST `/api/generate` with `keep_alive: 0` | used by `model_router.unload()` |
-
-Base URL: `http://localhost:11434` (`config.OLLAMA_BASE_URL`)
-
----
-
-## Prompts
-
-All prompts are domain-neutral — cloak parses any PDF type (D16).
-
-### Full-page extraction (vision_tools.py)
-```
-You are a document parser. Extract ALL content from this page into structured markdown.
-Include every heading, section title, body text, table, list, figure caption,
-footnote, and abbreviation visible on the page.
-Do NOT summarise — extract verbatim where possible.
-Use ## for major headings and ### for sub-headings.
-Reproduce tables in markdown table format.
-Output only the markdown. No preamble or closing remarks.
-```
-
-Used for ALL page types when vision is available — text_rich, image_heavy, and mixed (D23 updated). Headings are assigned from the visual layout in a single pass.
-
-### Quality judge (vision_tools.py)
-```
-You are a document QA reviewer. Score how completely the markdown captures
-EVERYTHING visible on the page (0.0 to 10.0). List missing content as gaps.
-Decide action: "accept" (≥8.0), "patch" (≥5.0), "fallback" (<5.0).
-Respond ONLY with valid JSON: {"score": float, "gaps": [str], "action": str}
-```
-
-### FORMAT prompt (parser_agent.py — qwen3:8b, Phase 4, D20)
-Single completion call — no tool loop. Starts with `/no_think` (suppresses qwen3 thinking chain). Context: `FORMAT_NUM_CTX = 8192`.
-
-```
-/no_think
-You are a document formatter. The content below has already been extracted by a vision model
-and may already have headings and structure. Your job:
-1. Preserve ALL content — never remove, summarise, or paraphrase.
-2. Remove duplicate sections if the same content appears twice (keep first occurrence).
-3. Preserve all existing headings and their levels (## / ###). Add headings only where clearly missing.
-4. Fix table markdown syntax. Never drop table rows or columns.
-5. Merge separate abbreviation lists into one Abbreviations section at the end.
-6. Output ONLY the markdown — no preamble, no "Here is the formatted..." intro.
-```
-
-Content-loss guard (D5) reverts to raw content if output < 65% of input. Long documents processed up to `FORMAT_NUM_CTX * 3` chars; unformatted tail appended directly so no content is lost.
-
-### Region prompts (vision_tools.py)
-Stored in `vision_tools._REGION_PROMPTS` — separate detailed prompts per label type. Domain-neutral: ECG prompt describes waveform characteristics; diagram prompt describes layout and labels; figure prompt describes visual content.
-
-### Deep review prompt (deep_review.py — gemma4:latest, Phase 9, D27)
-Structured audit comparing raw pdfplumber text vs final markdown. Produces sections: Missing Content, Wrong/Missing Headings, Table Issues, Duplicate Content, Formatting Problems, Overall Assessment, Quality Score (0–10), Priority Fixes.
+| `full_page_extract`, `region_describe` | False | Transcription task |
+| `poster_page`, `slide_page`, `exam_page` | False | Transcription task |
+| `judge_quality` (L4) | False | Completeness check — think=True causes timeout (D48) |
+| FORMAT pass | False | Pure transformation |
+| PATCH loop | True | Gap-filling needs deliberate reasoning |
+| Phase 9 deep review | True | Holistic audit benefits from reasoning chain |
 
 ---
 
-## Known hardware limits on dev machine (Session 11)
+## Known hardware limits (RTX 5050, 8 GB VRAM, 24 GB RAM)
 
-- `qwen2.5vl:7b` — `ready (GPU)` when ≥ 7.3 GB VRAM free; `ready (auto-split)` when total memory ≥ 7.3 GB; Ollama handles the split automatically
-- `qwen3-vl:4b` — always `ready (GPU)` on RTX 5050 (3.5 GB easily fits)
-- `gemma4:latest` — Phase 9 only, after teardown; ~8 GB GPU + ~1.6 GB RAM split; `DEEP_REVIEW_TIMEOUT = 600s`
-- **To maximise GPU layers:** run `cloak parse` — it calls `run_startup_cleanup()` to free idle models first
-- `VISION_TIMEOUT` = 400s; heavier auto-split runs are still within budget
+- `qwen3-vl:8b` — 6.1 GB, always full GPU. 1.9 GB headroom when alone; 0.3 GB RAM spill when coexisting with glm-ocr.
+- `qwen3-vl:4b` — 3.3 GB, always full GPU. Can coexist with LLM simultaneously (3.3+9=12.3 GB — possible in future if phase isolation relaxed).
+- `qwen3:14b` — 9.0 GB: ~8 GB VRAM + ~1 GB RAM. Fully unloads VLM first (D50).
+- `glm-ocr` — 2.2 GB: GPU when alone, RAM when VLM is loaded. 2.2 GB on RAM is fast enough for OCR.
+- **Never load VLM + LLM simultaneously** — 15.1 GB forces LLM entirely to CPU RAM (~2 tok/s).
+- **Always parse sequentially** — parallel parses compete for VRAM, causing 10x slower extraction.
+
+---
+
+## Legacy models (kept for .cloak_local.json overrides)
+
+| Model | Sessions used | Replaced by | Reason |
+|---|---|---|---|
+| `gemma4:26b` | Sessions 11–26 | qwen3-vl:8b + qwen3:14b | MoE with only 3.8B active params; 17 GB forces CPU split at ~2 tok/s |
+| `qwen3.6:27b` | Sessions 3–11 | qwen3:14b | Superseded; still in setup.py catalog for high-RAM machines |
+| `qwen2.5vl:7b` | Sessions 8–11 | qwen3-vl:8b | Superseded; still in setup.py catalog |
+| `qwen3-vl:4b` | Sessions 8–11 | qwen3-vl:8b (primary) | Now VISION_FALLBACK |

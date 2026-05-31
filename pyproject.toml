@@ -20,6 +20,8 @@ dependencies = [
     "typer>=0.12.0",
     "docling>=2.0.0",
     "surya-ocr>=0.17.0",
+    "transformers>=4.56.1,<5.0",
+    "pix2tex>=0.1.4",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +39,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cloak"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# -p no:capture: cloak reconfigures sys.stdout for UTF-8 at import time on Windows.
+# This breaks pytest's fd-level capture teardown. Disabling capture avoids the crash.
+addopts = "-p no:capture"
 
 [tool.ruff]
 line-length = 100

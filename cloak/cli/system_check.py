@@ -22,6 +22,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from cloak.config import (
+    GLM_OCR_MODEL,
     MIN_FREE_RAM_GB,
     OLLAMA_BASE_URL,
     ORCHESTRATOR_MODEL,
@@ -31,25 +32,29 @@ from cloak.config import (
 
 console = Console(legacy_windows=False)
 
-# Minimum free RAM each model needs (GB) — used when no GPU is present
+# Minimum free RAM each model needs (GB) — used when no GPU is present (D49)
 _MODEL_RAM_GB: dict[str, float] = {
-    VISION_PRIMARY:     9.0,   # qwen2.5vl:7b
-    ORCHESTRATOR_MODEL: 5.5,   # qwen3:8b
-    VISION_FALLBACK:    4.5,   # qwen3-vl:4b
+    "qwen3-vl:8b":  6.5,   # 6.1 GB — fits in GPU; RAM figure covers CPU-only fallback
+    "qwen3-vl:4b":  3.5,   # 3.3 GB — fits in GPU
+    "qwen3:14b":    9.5,   # 9.0 GB — ~8 GB VRAM + ~1 GB RAM on RTX 5050
+    "glm-ocr":      2.5,   # 2.2 GB — coexists with VLM or LLM
+    "gemma4:26b":  17.5,   # legacy — kept for .cloak_local.json overrides
 }
 
-# Approximate VRAM required at Q4_K_M quantization (±0.5 GB)
-# Models run on GPU when VRAM is sufficient; Ollama auto-splits to CPU+GPU otherwise
+# Approximate VRAM required at Q4_K_M quantization (±0.5 GB) (D49)
 _MODEL_VRAM_GB: dict[str, float] = {
-    VISION_PRIMARY:     7.3,   # qwen2.5vl:7b — vision encoder makes it ~7.3 GB
-    ORCHESTRATOR_MODEL: 5.2,   # qwen3:8b
-    VISION_FALLBACK:    3.5,   # qwen3-vl:4b
+    "qwen3-vl:8b":  6.1,   # full GPU on RTX 5050 (D49)
+    "qwen3-vl:4b":  3.3,   # full GPU, always fits (D49)
+    "qwen3:14b":    9.0,   # ~8 GB VRAM + ~1 GB RAM (D49)
+    "glm-ocr":      2.2,   # always-resident OCR, coexists with either model (D45)
+    "gemma4:26b":  17.0,   # legacy — kept for .cloak_local.json overrides
 }
 
 _MODEL_ROLE: dict[str, str] = {
-    VISION_PRIMARY:     "vision primary",
-    ORCHESTRATOR_MODEL: "orchestrator",
-    VISION_FALLBACK:    "vision fallback",
+    ORCHESTRATOR_MODEL: "text LLM — format · patch · review",
+    VISION_PRIMARY:     "vision LLM — figures · image pages · L4 judge",
+    VISION_FALLBACK:    "vision LLM — fallback",
+    GLM_OCR_MODEL:      "document OCR",
 }
 
 
@@ -188,10 +193,10 @@ def run_startup_cleanup() -> None:
         names = ", ".join(loaded)
         console.print(f"[dim]Released: {names}  →  freed {freed_str}[/dim]")
 
-    # Show top memory users only when total memory is genuinely insufficient
+    # Show top memory users only when total memory is genuinely insufficient for main model
     free_vram = get_free_vram_gb()
     free_ram  = get_free_ram_gb()
-    vision_vram_needed = _MODEL_VRAM_GB.get(VISION_PRIMARY, 7.3)
+    vision_vram_needed = _MODEL_VRAM_GB.get(ORCHESTRATOR_MODEL, 17.0)
     if (free_vram + free_ram) < vision_vram_needed:
         procs = get_top_processes()
         if procs:
@@ -234,10 +239,6 @@ def check_model_suitability(model: str, free_ram_gb: float, free_vram_gb: float 
     elif free_ram_gb >= ram_needed:
         status, backend = "ready", "CPU"
         note = f"{free_ram_gb:.1f} GB RAM free"
-
-    elif total_free >= vram_needed * 0.85:
-        status, backend = "marginal", "CPU+GPU"
-        note = f"need {vram_needed:.1f} GB, have {total_free:.1f} GB total"
 
     else:
         status, backend = "unavailable", ""
@@ -330,7 +331,15 @@ def show_startup_screen(show_commands: bool = False) -> None:
     models_tbl.add_column("Role",  style="dim",    min_width=17, no_wrap=True)
     models_tbl.add_column("Status · Note")
 
-    for model in (VISION_PRIMARY, ORCHESTRATOR_MODEL, VISION_FALLBACK):
+    # Show VLM, LLM, OCR — deduplicate in case .cloak_local.json collapses them (D49)
+    display_models: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for model in (VISION_PRIMARY, ORCHESTRATOR_MODEL, GLM_OCR_MODEL):
+        if model not in seen:
+            seen.add(model)
+            display_models.append((model, _MODEL_ROLE.get(model, "")))
+
+    for model, role in display_models:
         result    = check_model_suitability(model, free_ram, free_vram)
         is_pulled = any(model in m for m in installed)
         status    = result["status"]
@@ -347,23 +356,25 @@ def show_startup_screen(show_commands: bool = False) -> None:
             if backend == "GPU":
                 color = "green"
             elif backend == "auto-split":
-                color = "cyan"    # mostly GPU, tiny RAM spill — still fast
+                color = "cyan"
             else:
-                color = "yellow"  # CPU only
+                color = "yellow"
             label      = f"ready ({backend})" if backend else "ready"
             icon       = f"[{color}]✓[/{color}]"
             status_str = f"[{color}]{label}[/{color}]  [dim]{note}[/dim]"
-        elif status == "marginal":
-            label      = f"marginal ({backend})" if backend else "marginal"
-            icon       = "[yellow]~[/yellow]"
-            status_str = f"[yellow]{label}[/yellow]  [dim]{note}[/dim]"
         else:
             icon       = "[red]✗[/red]"
             status_str = f"[red]unavailable[/red]  [dim]{note}[/dim]"
 
-        models_tbl.add_row(icon, model, _MODEL_ROLE.get(model, ""), status_str)
+        models_tbl.add_row(icon, model, role, status_str)
 
     console.print(models_tbl)
+
+    # ── math OCR status (D35) ─────────────────────────────────────────────────
+    from cloak.extraction.math_ocr import is_pix2tex_available
+    if is_pix2tex_available():
+        console.print("  [dim]  pix2tex  local math OCR active (D35)[/dim]")
+
     console.print()
 
     # ── warnings ──────────────────────────────────────────────────────────────
@@ -381,6 +392,7 @@ def show_startup_screen(show_commands: bool = False) -> None:
         cmds = Table.grid(padding=(0, 2))
         cmds.add_column(style="bold cyan", no_wrap=True)
         cmds.add_column(style="dim")
+        cmds.add_row("cloak setup",        "pick & pull models for this machine")
         cmds.add_row("cloak parse <pdf>", "parse a single PDF")
         cmds.add_row("cloak parse <dir>", "parse all PDFs in a directory")
         cmds.add_row("cloak list",        "list all parsed documents")

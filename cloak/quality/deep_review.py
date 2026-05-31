@@ -18,6 +18,7 @@ import ollama
 
 from cloak.config import (
     DEEP_REVIEW_MODEL,
+    DEEP_REVIEW_NUM_CTX,
     DEEP_REVIEW_TIMEOUT,
     MODEL_KEEP_ALIVE,
     OLLAMA_BASE_URL,
@@ -26,46 +27,53 @@ from cloak.config import (
 # ── Review prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are a document quality auditor for medical PDF extractions.
+You are a document quality auditor. You compare two versions of a document and identify \
+extraction errors. You output structured reports with specific section headings only — \
+no summaries, no general commentary, no extra sections."""
 
-You are given two versions of the same document:
+_USER_FORMAT = """\
+You are comparing two versions of the same document. Fill in the template below exactly as shown.
+Do NOT change the section headings. Do NOT add extra sections. Replace each placeholder with your analysis.
 
-  RAW TEXT   — text extracted directly from the PDF by a library (complete, unformatted)
-  FINAL MD   — the result of vision OCR + AI formatting (may have gaps or errors)
+RAW TEXT is the ground truth (extracted directly from the PDF by a library).
+FINAL MD is the AI-processed result (may have gaps, formatting errors, or added content).
 
-Note: images, ECGs, diagrams, and flowcharts are described via a separate vision model
-and may appear in FINAL MD but not in RAW TEXT — do not flag these as missing.
+Images, diagrams, and logos are described by a vision model — they appear in FINAL MD but NOT in RAW TEXT.
+Do NOT flag vision-described content as missing.
 
-Produce a structured quality improvement report using EXACTLY these section headings:
+---
 
 ## Missing Content
-Every piece of information in RAW TEXT that is absent or truncated in FINAL MD.
-For each gap: quote the missing text, state which section it belongs under.
+[Every piece of information in RAW TEXT absent or truncated in FINAL MD. Quote the missing text and name the section it belongs under. If nothing is missing, write exactly: None identified.]
 
 ## Wrong or Missing Headings
-Headings that are at the wrong level, misspelled, merged, or not present.
-Show: current state → correct state.
+[Headings at the wrong level, misspelled, merged, or absent. Format each as: current state → correct state. If none, write exactly: None identified.]
 
 ## Table Issues
-Tables with missing columns, missing rows, broken markdown syntax, or misaligned data.
-Quote the affected table header and describe the problem.
+[Tables with missing columns/rows, broken syntax, or misaligned data. Quote the affected table header and describe the problem. If none, write exactly: None identified.]
 
 ## Duplicate Content
-Sections or paragraphs repeated unnecessarily. Quote the duplicate and its location.
+[Sections or paragraphs repeated unnecessarily. If none, write exactly: None identified.]
 
 ## Formatting Problems
-Numbered lists shown as unordered bullets, bold/italic text lost, code blocks broken, etc.
+[Numbered lists shown as bullets, bold/italic lost, content inside code fences that should be inline text, etc. If none, write exactly: None identified.]
 
 ## Overall Assessment
-Two-sentence summary of extraction quality and the main failure pattern.
+[Exactly two sentences: sentence 1 — overall extraction quality. Sentence 2 — the main failure pattern, or "No major issues found."]
 
 ## Quality Score
-A single number from 0 to 10. 10 = perfect. 0 = unreadable.
-Format: `Score: X/10`
+Score: [X]/10
 
 ## Priority Fixes
-Numbered list, most impactful first, max 6 items.
-Each item: one sentence — what to fix and where."""
+[Numbered list, max 6 items, most impactful first. Each item: one sentence — what to fix and where. If no fixes needed, write: None required.]
+
+---
+
+--- RAW TEXT ---
+{raw_text}
+
+--- FINAL MD ---
+{final_md}"""
 
 
 def parse_review_score(text: str) -> float | None:
@@ -93,22 +101,23 @@ def _call(raw_text: str, final_md: str) -> str:
     raw_trimmed = raw_text[:10_000]
     md_trimmed  = final_md[:10_000]
 
-    user_msg = (
-        f"--- RAW TEXT (pdfplumber, ground truth) ---\n{raw_trimmed}\n\n"
-        f"--- FINAL MD (vision + AI processed) ---\n{md_trimmed}"
-    )
+    user_msg = _USER_FORMAT.format(raw_text=raw_trimmed, final_md=md_trimmed)
 
     result_q: queue.Queue = queue.Queue()
 
     def _worker() -> None:
         try:
+            opts: dict = {"temperature": 0.1, "num_ctx": DEEP_REVIEW_NUM_CTX}
+            model_lower = DEEP_REVIEW_MODEL.lower()
+            if "gemma4" in model_lower or "qwen3" in model_lower:
+                opts["think"] = True   # deep audit benefits from reasoning chain (D49)
             resp = ollama.chat(
                 model=DEEP_REVIEW_MODEL,
                 messages=[
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user",   "content": user_msg},
                 ],
-                options={"temperature": 0.1},
+                options=opts,
                 keep_alive=MODEL_KEEP_ALIVE,
             )
             result_q.put(("ok", resp.message.content.strip()))
@@ -128,7 +137,14 @@ def _call(raw_text: str, final_md: str) -> str:
 
 
 def _unload() -> None:
-    """Unload DEEP_REVIEW_MODEL from memory after review."""
+    """
+    Unload DEEP_REVIEW_MODEL from memory after review.
+    With two-model split (D49), DEEP_REVIEW_MODEL == ORCHESTRATOR_MODEL — skip
+    unload here so teardown_pdf() handles it cleanly after _run_phase9() returns.
+    """
+    from cloak.config import ORCHESTRATOR_MODEL
+    if DEEP_REVIEW_MODEL == ORCHESTRATOR_MODEL:
+        return  # same model as pipeline — let teardown_pdf() handle unload
     try:
         import httpx
         httpx.post(

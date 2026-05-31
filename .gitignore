@@ -26,6 +26,9 @@ logs/*.log
 # Workspace registry (local state — not committed)
 .cloak/
 
+# Hardware-specific model config (written by `cloak setup`)
+.cloak_local.json
+
 # Claude Code local settings (permissions, session state — machine-specific)
 .claude/
 

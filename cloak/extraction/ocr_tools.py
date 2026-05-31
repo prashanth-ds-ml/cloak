@@ -1,10 +1,11 @@
 """
-ocr_tools.py — OCR for scanned pages. Surya primary, Tesseract fallback (D30).
+ocr_tools.py — OCR for scanned pages. GLM-OCR primary, Surya fallback, Tesseract last resort (D45).
 
 Fallback chain for scanned pages:
-  surya OCR (GPU-accelerated, reading-order-aware) → D30
-  tesseract (CPU fallback)                         → D22
-  raw PyMuPDF text blocks (last resort)            → caller handles
+  glm-ocr  (Ollama, 2.2 GB — #1 OmniDocBench, document-specialised)  → D45
+  surya    (GPU-accelerated, reading-order-aware)                      → D30
+  tesseract (CPU fallback)                                             → D22
+  raw PyMuPDF text blocks (last resort)                               → caller handles
 
 Tesseract requires the binary:
   Windows : winget install UB-Mannheim.TesseractOCR
@@ -12,16 +13,21 @@ Tesseract requires the binary:
   macOS   : brew install tesseract
 
 Surya models are downloaded from HuggingFace on first use and cached locally.
+GLM-OCR runs via Ollama — requires `ollama pull glm-ocr`.
 """
 from __future__ import annotations
 
+import io
 import re
+import queue
+import threading
 from pathlib import Path
 from typing import Any
 
+import ollama
 from PIL import Image, ImageFilter
 
-from cloak.config import OCR_LANG
+from cloak.config import GLM_OCR_MODEL, GLM_OCR_TIMEOUT, MODEL_KEEP_ALIVE, OCR_LANG
 
 _MIN_OCR_PX       = 2000            # upscale long edge before Tesseract — better accuracy
 _TESSERACT_CONFIG = "--oem 3 --psm 3"  # LSTM engine, fully automatic page segmentation
@@ -33,6 +39,7 @@ _WIN_TESSERACT_PATHS = [
 ]
 
 # Lazy-loaded surya predictor singletons (avoid reloading models per page)
+_surya_foundation: Any = None
 _surya_rec: Any = None
 _surya_det: Any = None
 
@@ -119,14 +126,16 @@ def clean_ocr_text(raw: str) -> str:
 # ── Surya OCR ─────────────────────────────────────────────────────────────────
 
 def _load_surya() -> tuple[Any, Any]:
-    """Lazy-load surya recognition + detection predictors. Cached after first load."""
-    global _surya_rec, _surya_det
+    """Lazy-load surya foundation, recognition, and detection predictors. Cached after first load."""
+    global _surya_foundation, _surya_rec, _surya_det
     if _surya_rec is None or _surya_det is None:
         try:
+            from surya.foundation import FoundationPredictor
             from surya.recognition import RecognitionPredictor
             from surya.detection import DetectionPredictor
-            _surya_rec = RecognitionPredictor()
+            _surya_foundation = FoundationPredictor()
             _surya_det = DetectionPredictor()
+            _surya_rec = RecognitionPredictor(_surya_foundation)
         except Exception as exc:
             raise OCRError(f"Surya model load failed: {exc}") from exc
     return _surya_rec, _surya_det
@@ -158,23 +167,93 @@ def is_surya_available() -> bool:
         return False
 
 
+# ── GLM-OCR (Ollama, primary) ─────────────────────────────────────────────────
+
+_GLM_OCR_PROMPT = """\
+Extract all content from this document page into clean markdown.
+- Preserve reading order top to bottom, left to right.
+- Reproduce tables in markdown table format with | header | ... | separator rows.
+- Reproduce mathematical formulas as LaTeX: inline $formula$ or block $$formula$$.
+- Preserve all text exactly — do NOT summarise or paraphrase.
+- Output only the extracted markdown content, no preamble or commentary."""
+
+
+def _ocr_page_glm(image: Image.Image) -> str:
+    """
+    Run GLM-OCR (Ollama) on a page image. #1 on OmniDocBench V1.5 (D45).
+    Handles text, tables, formulas, and complex layouts in one pass.
+    Raises OCRError on failure — caller falls back to surya.
+    """
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    result_q: queue.Queue = queue.Queue()
+
+    def _worker() -> None:
+        try:
+            resp = ollama.chat(
+                model=GLM_OCR_MODEL,
+                messages=[{
+                    "role":    "user",
+                    "content": _GLM_OCR_PROMPT,
+                    "images":  [img_bytes],
+                }],
+                options={"num_ctx": 4096},
+                keep_alive=MODEL_KEEP_ALIVE,
+            )
+            result_q.put(("ok", resp.message.content.strip()))
+        except Exception as exc:
+            result_q.put(("err", exc))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        kind, value = result_q.get(timeout=GLM_OCR_TIMEOUT)
+    except queue.Empty:
+        raise OCRError(f"GLM-OCR timed out after {GLM_OCR_TIMEOUT}s")
+
+    if kind == "err":
+        raise OCRError(f"GLM-OCR failed: {value}")
+    if not value:
+        raise OCRError("GLM-OCR returned empty response")
+    return value
+
+
+def is_glm_ocr_available() -> bool:
+    """True when glm-ocr is present in Ollama's local model list."""
+    try:
+        models = ollama.list()
+        names = [m.model for m in models.models]
+        return any("glm-ocr" in n for n in names)
+    except Exception:
+        return False
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def ocr_page(image: Image.Image, lang: str = OCR_LANG) -> str:
     """
-    OCR a scanned page image. Tries Surya first (D30), falls back to Tesseract.
+    OCR a scanned page image. Fallback chain: GLM-OCR → surya → tesseract (D45).
 
-    Raises OCRError only when both engines fail.
+    Raises OCRError only when all engines fail.
     Callers should catch OCRError and fall back to raw PyMuPDF text.
     """
-    # Try Surya primary (D30)
+    # GLM-OCR primary (D45) — document-specialised, handles tables + formulas
+    if is_glm_ocr_available():
+        try:
+            return _ocr_page_glm(image)
+        except OCRError:
+            pass  # fall through to surya
+
+    # Surya fallback (D30) — reading-order-aware
     if is_surya_available():
         try:
             return _ocr_page_surya(image)
         except OCRError:
-            pass  # fall through to Tesseract
+            pass  # fall through to tesseract
 
-    # Tesseract fallback (D22)
+    # Tesseract last resort (D22)
     return _ocr_page_tesseract(image, lang)
 
 
@@ -202,9 +281,56 @@ def _ocr_page_tesseract(image: Image.Image, lang: str = OCR_LANG) -> str:
     return clean_ocr_text(raw)
 
 
+def extract_table_glm(image: Image.Image) -> str:
+    """
+    Extract a table image crop into markdown table format via GLM-OCR (D45).
+    Returns "" when GLM-OCR is unavailable or fails — caller keeps docling/pdfplumber result.
+    """
+    if not is_glm_ocr_available():
+        return ""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    result_q: queue.Queue = queue.Queue()
+
+    def _worker() -> None:
+        try:
+            resp = ollama.chat(
+                model=GLM_OCR_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Extract this table into markdown table format. "
+                        "Use | column | headers | with a | --- | --- | separator row. "
+                        "Preserve all cell values exactly including numbers and units. "
+                        "For merged/spanning cells repeat the value in each affected cell. "
+                        "Output only the markdown table, no preamble."
+                    ),
+                    "images": [img_bytes],
+                }],
+                options={"num_ctx": 2048},
+                keep_alive=MODEL_KEEP_ALIVE,
+            )
+            result_q.put(("ok", resp.message.content.strip()))
+        except Exception as exc:
+            result_q.put(("err", exc))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    try:
+        kind, value = result_q.get(timeout=GLM_OCR_TIMEOUT)
+    except queue.Empty:
+        return ""
+
+    if kind == "err" or not value:
+        return ""
+    return value
+
+
 def is_available() -> bool:
-    """Return True if at least one OCR engine (Surya or Tesseract) is ready."""
-    return is_surya_available() or _is_tesseract_available()
+    """Return True if at least one OCR engine (GLM-OCR, Surya, or Tesseract) is ready."""
+    return is_glm_ocr_available() or is_surya_available() or _is_tesseract_available()
 
 
 def _is_tesseract_available() -> bool:

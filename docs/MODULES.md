@@ -1,13 +1,13 @@
 ---
 type: module-specs
-updated: 2026-05-16 (Session 8)
+updated: 2026-05-23 (Session 19)
 ---
 
 # Module Specs — cloak
 
 > Related: [[docs/ARCHITECTURE.md]] · [[docs/MODELS.md]] · [[docs/DECISIONS.md]] · [[docs/PROGRESS.md]]
 
-**11 modules done, 4 need updates, 1 planned.** New work from Session 9: `doc_profiler` (planned), `page_profiler` (needs DocProfile integration), `ocr_tools` (needs Surya), `model_router` (needs ParsePlan routing), `quality_judge` (needs structural fidelity).
+**14 modules done. 1 planned (D38 — slide deck mode).**
 **Legacy files** (`pdf_extractor.py`, `pdf_classifier.py`, `vision.py`, `markdown_builder.py`): read-only, stay in `ingestion/`.
 
 ---
@@ -48,16 +48,29 @@ TableData(rows, page_num)            # .to_markdown() → markdown table string
 ### Public API
 ```python
 full_page_extract(image, model, timeout) -> str   # full page → markdown (headings from visual layout)
-region_describe(image, label, model, timeout) -> str  # ECG/diagram → description
+region_describe(image, label, model, timeout) -> str  # figure/diagram → description
 judge_quality(page_image, extracted_md, model, timeout) -> dict
     # returns: {"score": float, "gaps": [str], "action": "accept"|"patch"|"fallback"}
 ```
 
-`layout_hints()` was removed in Session 8 — heading detection now happens inside `full_page_extract()` directly (D23 update). `_build_layout_context()` in parser_agent was also removed.
+`layout_hints()` removed in Session 8 — heading detection inside `full_page_extract()` directly (D23 update).
 
 ### Image handling
 - All images resized to long edge ≤ `MAX_IMAGE_PX` (1024px) before encoding as PNG
+- Judge images capped at `JUDGE_MAX_IMAGE_PX` (512px) — reduces visual tokens ~4× for faster scoring
 - Encoding via `_prepare_image()` — LANCZOS downsample if needed
+
+### JSON fallback chain in judge_quality (D34)
+If vision model returns non-JSON, strips markdown fences and runs through:
+1. `json.loads()` — strict parse
+2. Regex `"score": X.X` — extracts score from free-form text
+3. Regex `X/10` pattern — last numeric fallback
+4. Neutral 5.0 — never crashes the loop
+
+Returns `{"score": 5.0, "gaps": [], "action": "patch"}` as final safety net.
+
+### Hallucination filter (Gap F, Session 18)
+`_HALLUCINATION_RE` detects VLM meta-commentary ("It seems the description...", "I cannot see...") that is not document content. `_strip_hallucination()` returns `""` for matching responses — prevents garbage from entering the markdown.
 
 ### Exceptions
 ```python
@@ -65,27 +78,28 @@ VisionTimeoutError   # daemon thread didn't complete within timeout
 VisionCallError      # Ollama returned an error (e.g. insufficient RAM)
 ```
 
-### JSON fallback in judge_quality
-If model returns non-JSON, strips markdown fences and retries `json.loads`. On failure: returns `{"score": 0.0, "gaps": ["JSON parse failed"], "action": "patch"}` — never crashes.
-
 ---
 
-## 3 · quality/quality_judge.py ✅ done — needs structural fidelity scoring (D31)
+## 3 · quality/quality_judge.py ✅ done — structural fidelity + heuristic judge (D31, D33)
 
-**Purpose:** Typed scoring layer on top of `vision_tools.judge_quality()`. Combined score = 0.7 × content_score + 0.3 × structure_score (D31).
+**Purpose:** Typed scoring layer on top of `vision_tools.judge_quality()`. Combined score = 0.7 × content_score + 0.3 × structure_score (D31). Per-page routing: vision judge for image/scanned pages, heuristic for text-only pages (D33).
 
 ### Key functions
 ```python
 judge(page_image, extracted_md, round_num, model, timeout) -> JudgeResult
+heuristic_judge(page_num, extracted_md, page_text) -> PageScore    # D33 — no vision call
 aggregate_page_results(results: list[JudgeResult]) -> (avg_score, all_gaps, action)
 ```
 
-### PageScore (replaces JudgeResult — D24)
+### heuristic_judge (D33)
+Used for `text_rich` and `table_heavy` pages with `needs_vision=False`. Computes word-overlap ratio between pdfplumber text and extracted markdown, adds structure bonus for heading/table presence. No model call — microseconds. Prevents 2000s+ judge phases on text-only documents.
+
+### PageScore
 ```python
 @dataclass
 class PageScore:
     page_num: int
-    score: float        # 0.0 – 10.0
+    score: float        # 0.0 – 10.0 (combined 0.7×content + 0.3×structure)
     confidence: str     # "High" (≥8.0) | "Medium" (≥5.0) | "Low" (<5.0)
     gaps: list[str]     # missing content descriptions
     action: str         # "accept" | "patch" | "fallback"
@@ -107,50 +121,42 @@ If `VisionTimeoutError` or `VisionCallError` → returns `JudgeResult(score=5.0,
 
 ## 4 · orchestration/model_router.py ✅ done + wired
 
-**Purpose:** VRAM-aware model selection. Enforces the VRAM coexistence rule.
+**Purpose:** VRAM-aware model selection. Enforces phase-based load/unload rules. D37: conditional phase boundary.
 
 ### Key functions
 ```python
 reset()                      # called at start of each PDF
 get_vision_model() -> str    # returns sticky model or VISION_PRIMARY
 mark_success(model)          # sets sticky model after a successful call
-before_vision_phase()        # phase boundary: unloads qwen3:8b when llama3.2 is sticky
-before_orchestrator_phase()  # phase boundary: unloads llama3.2 when sticky, resets sticky→None
+before_vision_phase()        # phase boundary: unloads qwen3.6 when fallback is sticky
+before_orchestrator_phase()  # phase boundary: unloads fallback when sticky, resets sticky→None
 teardown_pdf()               # unloads vision model, resets sticky
+set_parse_plan(plan)         # stores ParsePlan for model_tier routing (D28)
 loaded_models() -> list[str] # GET /api/ps
 unload(model)                # POST keep_alive=0
-# kept for compatibility (not called in main path):
-switch_to_fallback()
-restore_orchestrator()
-using_fallback() -> bool
 ```
 
-### Call sequence in parser_agent (D14 — phase-based)
+### D37 — conditional phase boundary
+`before_orchestrator_phase()` is only called when `needs_fmt=True`. When FORMAT is skipped, vision model stays loaded and judge reuses it immediately — no cold reload (30–60s saved per skipped-format round).
+
+### Call sequence in parser_agent
 ```
 parse() start:            model_router.reset()
 _probe_vision():          mark_success(winner)          ← sets sticky for whole PDF
 
 Round 1:
-  VISION PHASE:           before_vision_phase()         ← unload qwen3 if llama3.2 sticky
-  _extract_all_pages():   get_vision_model()            ← sticky or VISION_PRIMARY (once only)
-  quality_judge.judge():  get_vision_model()
-  ORCHESTRATOR PHASE:     before_orchestrator_phase()   ← unload llama3.2; sticky→None
-  _run_format_session():  qwen3:8b auto-loads
-  _run_patch_loop():      qwen3:8b
+  VISION PHASE:           before_vision_phase()
+  _extract_docling_page() or _extract_*_page(): get_vision_model() (FigureItems only or image_heavy/mixed)
+  quality_judge.judge():  get_vision_model() / heuristic_judge()
+  ORCHESTRATOR PHASE:     before_orchestrator_phase() [only if needs_fmt]
+  _run_format_session():  qwen3.6:27b auto-loads
 
 Rounds 2+:
   VISION PHASE:           before_vision_phase()
-  quality_judge.judge():  get_vision_model()            ← no re-extract (D19)
+  quality_judge.judge():  get_vision_model() / heuristic_judge()
   ORCHESTRATOR PHASE:     before_orchestrator_phase()
-  _run_patch_loop():      qwen3:8b
-
-parse() end:              teardown_pdf()
+  _run_patch_loop():      qwen3.6:27b
 ```
-
-### VRAM rule enforcement
-`before_vision_phase()` checks if sticky == `VISION_FALLBACK` and calls `unload(ORCHESTRATOR_MODEL)`.
-`before_orchestrator_phase()` checks if sticky == `VISION_FALLBACK`, calls `unload(VISION_FALLBACK)`, resets `_sticky_vision = None`.
-`qwen2.5vl:7b` + `qwen3:8b` can coexist — neither boundary fires for them.
 
 ---
 
@@ -163,7 +169,7 @@ parse() end:              teardown_pdf()
 estimate_tokens(messages) -> int     # rough: total chars / 4
 compress_history(messages, token_limit, model) -> list[dict]
     # keeps: messages[0] (system prompt) + last 4 messages
-    # summarises: everything between via qwen3:8b
+    # summarises: everything between via qwen3.6:27b
 summarise_messages(messages, model) -> str  # 200-word summary call
 ```
 
@@ -171,7 +177,7 @@ summarise_messages(messages, model) -> str  # 200-word summary call
 Only compresses if `estimate_tokens(messages) > CONTEXT_TOKEN_LIMIT`. Short conversations pass through unchanged.
 
 ### Safety
-If summarise call times out → returns `"[Summary unavailable — timeout]"` and continues. Never crashes the loop.
+If summarise call times out → returns `"[Summary unavailable — timeout]"` and continues.
 
 ---
 
@@ -185,55 +191,70 @@ from cloak.orchestration.parser_agent import parse
 parse(pdf_path: Path, deep_review: bool = True)
 ```
 
-### 9-phase pipeline (D14 + D19 + D20 + D21 + D23 + D24 + D27)
+### 9-phase pipeline (D14 + D19 + D20 + D28 + D29 + D30 + D33 + D35 + D37)
 ```
-Phase 0  intake:    load_pages(), create output dir, create images_dir
-Phase 1  profiler:  profile_all(pages) → RouteMap
-Phase 3  extract:   _extract_by_route(pages, route_map, images_dir)
-           → ALL pages use vision when available (D23 updated)
-           → text_rich: _extract_text_page_vision() — full_page_extract for headings
-           → image_heavy/mixed: _extract_text_page_vision() — full page + region describe
-           → table_heavy: _extract_table_page()
-           → scanned: _extract_scanned_page()
-Phase 4  format:    qwen3:8b FORMAT session (D20) — once; /no_think prefix; FORMAT_NUM_CTX=8192
-Phase 5  judge:     quality_judge per page — every round (D24)
-Phase 6  patch:     qwen3:8b PATCH — targeted (D5 guard)
-          repeat phases 5–6 up to MAX_ROUNDS, best round wins (D2/D3)
-Phase 8  output:    final.md + confidence_report.md (D24) + images logged
-model_router.teardown_pdf()
-Phase 9  deep review: deep_review.run() — gemma4:latest CPU+GPU split (D27)
+Phase 0  intake:      load_pages(), create output dir, create images_dir
+Phase 1  intelligence: run_docling_pass() → DoclingPageMap
+                        heuristic profile_all(pages) → RouteMap
+                        update_vision_from_docling() — refine needs_vision per page (D29)
+                        build_doc_profile() → DocProfile (formula_count, vision_dependency, …)
+                        build_parse_plan() → ParsePlan (model_tier, max_rounds, use_math_ocr, …)
+Phase 2  staging:     probe vision based on ParsePlan.model_tier
+Phase 3  extract:     _extract_by_route() dispatcher:
+                        if docling available + not scanned → _extract_docling_page() (D29)
+                          SectionHeaderItem → ##/###/#### heading
+                          TextItem          → pdfplumber chars
+                          TableItem         → pdfplumber (simple) or docling (complex)
+                          FigureItem        → bbox crop → vision.region_describe() + caption
+                          FootnoteItem      → collected, appended at section end
+                          FormulaItem       → pix2tex bbox crop → $$latex$$ (D35); fallback `text`
+                          Gap A: empty docling → pdfplumber _extract_text_page() fallback
+                          Gap C: garbled glyphs → reroute to vision extraction
+                        scanned → _extract_scanned_page() → surya OCR → tesseract fallback (D30)
+                        image_heavy (no docling) → _extract_vision_page()
+                        mixed (no docling) → _extract_mixed_page()
+Phase 4  format:      qwen3.6:27b FORMAT once (D20) — /no_think; FORMAT_NUM_CTX=32768; content-loss guard
+Phase 5  judge:       per-page routing: text_rich/no-vision → heuristic_judge (D33);
+                        image/mixed/scanned → vision judge (sampled per ParsePlan.judge_sample_rate)
+                        carryover: pages ≥ JUDGE_SKIP_THRESHOLD skip re-judge (D31)
+Phase 6  patch:       qwen3.6:27b PATCH — targeted gaps; content-loss guard (D5)
+          Phases 5–6 repeat up to ParsePlan.max_rounds; best round wins (D2); stop at ≥ 8.0 (D3)
+Phase 8  output:      final.md + confidence_report.md + flagged.md + images/
+          model_router.teardown_pdf()
+Phase 9  deep review: gemma4:latest compares pdfplumber text vs final.md → review.md (D27)
 ```
 
 ### Extraction functions
 ```python
-_extract_by_route(pages, route_map, images_dir=None) -> str        # dispatcher
-_extract_text_page_vision(pg, model, images_dir=None) -> str       # vision for ANY page type
-_extract_text_page(pg) -> str                                       # pdfplumber fallback (no vision)
-_extract_table_page(pg) -> str                                      # pdfplumber tables
-_extract_scanned_page(pg) -> str                                    # Tesseract OCR
-_extract_mixed_page(pg, model, images_dir=None) -> str             # text + vision for regions
-_extract_vision_page(pg, model, images_dir=None) -> str            # image_heavy full-page
+_extract_by_route(pages, route_map, vision_available, on_page_done, images_dir, element_map, use_math_ocr) -> str
+_extract_docling_page(elements, pg, vision_available, model, images_dir, use_math_ocr) -> str  # D29 + D35
+_extract_text_page_vision(pg, model, images_dir) -> str    # image_heavy/mixed without docling
+_extract_text_page(pg) -> str                              # pdfplumber fallback (no vision)
+_extract_table_page(pg) -> str                             # pdfplumber tables
+_extract_scanned_page(pg) -> str                           # surya → tesseract fallback (D30)
+_extract_mixed_page(pg, model, images_dir) -> str          # text + region vision (no docling)
+_extract_vision_page(pg, model, images_dir) -> str         # image_heavy full-page (no docling)
+_crop_normalized(image, bbox_norm) -> PIL.Image | None     # crop by normalised bbox
 ```
 
-### Region image persistence
-```python
-_images_dir(md_path: Path) -> Path    # returns {stem}_images/ dir, creates if needed
-_save_region(image, images_dir, page_num, label, idx) -> Path  # saves PNG, returns relative path
-```
-Region crops saved as `{stem}_images/page_{n}_{label}_{i}.png`. Embedded in markdown as `![label](relative_path)`.
+### Artifact cleanup
+`_clean_output_artifacts()` runs after extraction:
+- Gap D: `re.sub(r"^\.$", "", text, flags=re.MULTILINE)` — removes TOC leader dots
+- `<math>` watermark: filters `<math display="block">\mathsf{Digitized}\,\mathsf{by}\,Google</math>` artifacts
 
 ### Output
 ```
 data/markdown/{specialty}/{stem}.md
 data/markdown/{specialty}/{stem}_confidence.md
 data/markdown/{specialty}/{stem}_review.md    ← Phase 9 (if deep_review=True)
-data/markdown/{specialty}/{stem}_images/      ← region crops (if any regions found)
-  page_0_ecg_0.png
-  page_3_diagram_0.png
+data/markdown/{specialty}/{stem}_flagged.md   ← pages < LOW_CONFIDENCE_THRESHOLD (5.0)
+data/markdown/{specialty}/{stem}_images/      ← figure/region crops
+  page_0_figure_0.png
+  page_3_figure_1.png
   ...
 ```
 
-### Tool-calling tools (qwen3:8b patch loop)
+### Tool-calling tools (qwen3.6:27b patch loop)
 | Tool | Purpose |
 |---|---|
 | `get_page_text(page_num)` | Return sorted text for a page |
@@ -242,79 +263,11 @@ data/markdown/{specialty}/{stem}_images/      ← region crops (if any regions f
 | `add_section(heading, content)` | Append a new section |
 | `finish(markdown)` | Signal patch complete, return final markdown |
 
-### FORMAT session (qwen3:8b — Phase 4, once — D20)
-Single `ollama.chat()` completion call — no tool loop. Input: raw_content string. Output: structured markdown. Context: `FORMAT_NUM_CTX = 8192` (larger than standard to prevent qwen3 thinking tokens truncating output).
-
-System prompt starts with `/no_think` (suppresses qwen3 thinking chain). 6 rules: content from pre-structured vision output → dedup → preserve headings/levels → tables → merge abbreviation lists → no preamble. Content-loss guard (D5) reverts if output < 65% of input.
-
-### Content-loss guard
-After every format or patch: `if len(new) < len(old) * 0.65` → revert. Configured via `config.CONTENT_LOSS_LIMIT`.
-
-### Output path logic
-`data/raw/{specialty}/{stem}.pdf` → `data/markdown/{specialty}/{stem}.md`
-Falls back to `data/markdown/{stem}.md` if no `raw/` directory in path.
-
 ---
 
-## 12 · profiling/doc_profiler.py 🔲 planned (D28)
+## 7 · profiling/page_profiler.py ✅ done
 
-**Purpose:** Aggregate page profiles into a document-level `DocProfile` and generate a `ParsePlan` — the agent's contract for adaptive round budget, model tier, and judge sampling rate. Runs after page_profiler, before any model load.
-
-### Key functions
-```python
-build_doc_profile(page_profiles: list[PageProfile]) -> DocProfile
-build_parse_plan(doc_profile: DocProfile, primary_viable: bool, use_docling: bool) -> ParsePlan
-```
-
-### DocProfile
-```python
-@dataclass
-class DocProfile:
-    page_count:         int
-    type_distribution:  dict[str, float]  # fraction per page type
-    vision_dependency:  str               # "none" | "low" | "medium" | "high"
-    complexity_score:   float             # 0.0–1.0
-    size_tier:          str               # "small"(<50) | "medium"(50–200) | "large"(200–500) | "huge"(>500)
-```
-
-**vision_dependency thresholds:**
-- `none`   — < 5% image_heavy + mixed + scanned
-- `low`    — 5–20%
-- `medium` — 20–50%
-- `high`   — > 50%
-
-**complexity_score** = weighted sum: scanned×0.4 + image_heavy×0.3 + mixed×0.2 + table_heavy×0.1
-
-### ParsePlan
-```python
-@dataclass
-class ParsePlan:
-    model_tier:         str    # "none" | "fallback" | "primary"
-    max_rounds:         int    # base from size_tier ± complexity adjustment
-    judge_sample_rate:  float  # 1.0 / 0.6 / 0.3 / 0.1 by size tier
-    use_docling:        bool   # True when docling installed and importable
-```
-
-**Adaptive round budget:**
-| size_tier | base rounds | judge_sample_rate |
-|---|---|---|
-| small | 4 | 1.0 |
-| medium | 3 | 0.6 |
-| large | 2 | 0.3 |
-| huge | 1 | 0.1 |
-
-complexity_score > 0.6 → +1 round; < 0.3 → −1 round (min 1).
-
-### Dependencies
-- `profiling/page_profiler.py` — consumes `list[PageProfile]`
-- `cloak.cli.system_check` — reads free VRAM/RAM for model_tier decision
-- No model calls — pure computation
-
----
-
-## 7 · profiling/page_profiler.py ✅ done — needs DocProfile integration
-
-**Purpose:** Classify each PDF page heuristically (zero models) and produce a RouteMap. When docling is installed, classification is driven by docling's element map instead of heuristics. See [[docs/DECISIONS.md]] §D21 §D29.
+**Purpose:** Classify each PDF page heuristically (zero models) and produce a RouteMap. When docling is installed, `needs_vision` is refined via `update_vision_from_docling()`. See [[docs/DECISIONS.md]] §D21 §D29.
 
 ### Key functions
 ```python
@@ -322,6 +275,7 @@ profile_page(page: PageData) -> PageProfile
 profile_all(pages: list[PageData]) -> list[PageProfile]
 build_route_map(profiles: list[PageProfile]) -> RouteMap
 summarise(profiles: list[PageProfile]) -> dict[str, int]   # count by type
+update_vision_from_docling(profiles, element_map) -> None  # D29 — refine needs_vision
 ```
 
 ### PageProfile
@@ -334,45 +288,47 @@ class PageProfile:
     table_count: int          # pdfplumber tables found on this page
     page_type: str            # "text_rich" | "table_heavy" | "image_heavy" | "scanned" | "mixed"
     needs_ocr: bool
-    needs_vision: bool
+    needs_vision: bool        # refined by update_vision_from_docling after docling pass
 ```
 
-### Classification rules (priority order — earlier takes precedence)
+### Classification rules (priority order)
 | Condition | Type |
 |---|---|
-| `text_length < SCANNED_TEXT_THRESHOLD(100) AND image_area_ratio > IMAGE_AREA_THRESHOLD(0.4)` | `scanned` |
-| `image_area_ratio > 0.5 AND text_length < SCANNED_TEXT_THRESHOLD * 5` | `image_heavy` |
+| `text_length < 100 AND image_area_ratio > 0.4` | `scanned` |
+| `image_area_ratio > 0.5 AND text_length < 500` | `image_heavy` |
 | `table_count >= 2` | `table_heavy` |
-| `image_area_ratio > 0.2 AND text_length >= SCANNED_TEXT_THRESHOLD` | `mixed` |
+| `image_area_ratio > 0.2 AND text_length >= 100` | `mixed` |
 | everything else | `text_rich` |
 
-Note: `image_heavy` requires sparse text (`< 500 chars`) so PDFs with large background images but real digital text are classified as `mixed`, not `image_heavy`.
-
-### RouteMap
-```python
-RouteMap = dict[int, str]  # {page_num: page_type}
-```
-
-### Dependencies
-- Uses `PageData` from `extraction/pdf_tools.py` — no additional imports needed
-- `config.SCANNED_TEXT_THRESHOLD`, `config.IMAGE_AREA_THRESHOLD`
+### update_vision_from_docling
+After docling pass, sets `needs_vision=True` only for pages that have actual `picture` elements. Prevents vision being called for heading-only or text-rich pages where docling already handles structure.
 
 ---
 
-## 8 · extraction/ocr_tools.py ✅ done — needs Surya upgrade (D30)
+## 8 · extraction/ocr_tools.py ✅ done — Surya primary + Tesseract fallback (D30)
 
-**Purpose:** OCR for scanned pages. Primary: Surya (GPU-accelerated, reading-order-aware). Fallback: Tesseract. Called by `parser_agent` for pages where `RouteMap[page_num] == "scanned"`. See [[docs/DECISIONS.md]] §D22 §D30.
+**Purpose:** OCR for scanned pages. Primary: Surya (GPU-accelerated, reading-order-aware). Fallback: Tesseract. Called by `parser_agent` for `RouteMap[page_num] == "scanned"`. See [[docs/DECISIONS.md]] §D22 §D30.
 
 ### Key functions
 ```python
 ocr_page(image: PIL.Image, lang: str = "eng") -> str
-    # renders page through pytesseract → clean text string
-    # preprocesses: convert to grayscale, mild contrast boost
+    # Dispatches to Surya (when OCR_PRIMARY=="surya" + GPU) or Tesseract
+    # Returns clean text string; raises OCRError on binary not found
 
 clean_ocr_text(raw: str) -> str
     # remove page numbers, repeated headers, fix hyphenation
     # normalise whitespace and line endings
 ```
+
+### Surya API (D30 — Session 18 fix)
+```python
+_load_surya() -> tuple[RecognitionPredictor, DetectionPredictor]:
+    _surya_foundation = FoundationPredictor()       # must be created first
+    _surya_det = DetectionPredictor()
+    _surya_rec = RecognitionPredictor(_surya_foundation)  # pass foundation as arg
+```
+
+`RecognitionPredictor` changed API in newer surya versions — requires `FoundationPredictor` as first positional arg. `transformers>=5.0` breaks `SuryaDecoderConfig.pad_token_id` access → pinned `transformers>=4.56.1,<5.0` in `pyproject.toml`.
 
 ### Image preprocessing (before OCR)
 ```python
@@ -380,23 +336,19 @@ _preprocess(image: PIL.Image) -> PIL.Image:
     # 1. convert to grayscale
     # 2. ImageFilter.SHARPEN (mild)
     # 3. resize to min 2000px long edge for OCR resolution
-    # returns preprocessed PIL image
 ```
 
 ### Exception handling
 ```python
-OCRError  # raised if tesseract binary not found or call fails
+OCRError  # raised if binary not found or call fails
 ```
-On `OCRError` → caller falls back to raw PyMuPDF text blocks (same as text_rich path).
-
-### Dependencies
-- `pytesseract` — Python wrapper
-- Tesseract binary must be installed on system (Windows: Tesseract-OCR installer)
-- `Pillow` (already in deps)
+On `OCRError` → caller falls back to raw PyMuPDF text blocks.
 
 ### Config
 ```python
-OCR_LANG = "eng"  # add to config.py — extend to "eng+hin" etc. if needed
+OCR_PRIMARY  = "surya"     # primary OCR engine (D30)
+OCR_FALLBACK = "tesseract" # fallback when surya unavailable or GPU absent
+OCR_LANG     = "eng"       # Tesseract language code
 ```
 
 ---
@@ -405,141 +357,167 @@ OCR_LANG = "eng"  # add to config.py — extend to "eng+hin" etc. if needed
 
 **Purpose:** Hardware probe + VRAM-aware model suitability display at startup. Startup memory cleanup. RAM gate before parsing begins.
 
-**Location:** `cloak/cli/system_check.py` — imported as `from cloak.cli import system_check`
-
 ### Key functions
 ```python
-get_free_ram_gb() -> float              # psutil.virtual_memory().available / 1e9
-get_total_ram_gb() -> float             # psutil.virtual_memory().total / 1e9
-get_free_vram_gb() -> float             # nvidia-smi --query-gpu=memory.free (MiB → GB)
-get_total_vram_gb() -> float            # nvidia-smi --query-gpu=memory.total
-get_gpu_name() -> str                   # nvidia-smi --query-gpu=name
-is_ollama_running() -> bool             # GET /api/tags — returns False on any error
-get_installed_models() -> list[str]     # GET /api/tags → model name list
+get_free_ram_gb() -> float
+get_total_ram_gb() -> float
+get_free_vram_gb() -> float
+get_total_vram_gb() -> float
+get_gpu_name() -> str
+is_ollama_running() -> bool
+get_installed_models() -> list[str]
 check_model_suitability(model, free_ram_gb, free_vram_gb=0.0) -> dict
-    # VRAM-aware priority: GPU → CPU+GPU → CPU → marginal → unavailable
-    # returns: {"model", "status", "backend", "note", "reason", "required_vram_gb", "required_ram_gb"}
-show_startup_screen(show_commands=False) -> None  # banner + hardware grid + model status table
-run_startup_cleanup() -> None            # unload idle Ollama models; show top procs if RAM tight
-ram_gate(min_gb=MIN_FREE_RAM_GB) -> bool  # warns if low, never blocks
-get_top_processes(n=6, min_mb=250) -> list[dict]  # top N processes by RAM for memory hint
+show_startup_screen(show_commands=False) -> None
+run_startup_cleanup() -> None
+ram_gate(min_gb=MIN_FREE_RAM_GB) -> bool
+get_top_processes(n=6, min_mb=250) -> list[dict]
 ```
 
-All functions are safe to call anytime — never raise; failures return sentinel values (0.0, "unknown", []).
-
-### VRAM-aware suitability (Session 8 — D18)
-`check_model_suitability()` now accepts `free_vram_gb`. Priority:
-1. GPU — fits fully in VRAM → `ready (GPU)`
-2. CPU+GPU split — VRAM + RAM covers model → `ready (CPU+GPU)`
-3. CPU — no GPU but RAM sufficient → `ready (CPU)` (yellow)
-4. Marginal (≥ 85% of needed) → `marginal`
-5. Otherwise → `unavailable`
-
-### Model requirements (Session 8)
-| Model | VRAM needed | RAM needed | Role |
-|---|---|---|---|
-| `qwen2.5vl:7b` | 7.3 GB | 9.0 GB | Vision primary |
-| `qwen3:8b` | 5.2 GB | 5.5 GB | Orchestrator |
-| `qwen3-vl:4b` | 3.5 GB | 4.5 GB | Vision fallback |
-
-### RAM gate behaviour
-If both VRAM and RAM are insufficient for `VISION_PRIMARY`: print warning, return `False`. Never blocks execution — let the runtime probe (`_probe_vision`) decide.
-
-### Startup screen visibility (D17 update)
-`show_startup_screen(show_commands=True)` — called only on bare `cloak`. `show_startup_screen()` (no commands) — called only on `cloak status`. NOT called on `cloak parse` or `cloak list`.
-
-### Dependencies
-- `psutil` (in pyproject.toml)
-- `subprocess` — for `nvidia-smi` calls
-- `httpx` — for Ollama API calls
-- `rich` — for display
+### Startup screen visibility (D17)
+`show_startup_screen(show_commands=True)` — bare `cloak` only.
+`show_startup_screen()` — `cloak status` only.
+NOT called on `cloak parse` or `cloak list`.
 
 ---
 
 ## 10 · cli/main.py ✅ done
 
-**Purpose:** typer CLI entry point. Startup screen only on bare `cloak` and `cloak status` (D17 updated).
+**Purpose:** typer CLI entry point.
 
 ### Commands
 ```
 cloak                    → run_startup_cleanup() + show_startup_screen(show_commands=True)
-cloak parse <pdf|dir>    → parse single PDF or all PDFs; no startup screen; supports --no-review
+cloak parse <pdf|dir>    → parse PDF(s); no startup screen; supports --no-review, --dry-run
 cloak status             → run_startup_cleanup() + show_startup_screen()
-cloak list               → table of data/markdown/ contents with size + date + confidence flag
+cloak list               → table of data/markdown/ contents with score + status (registry)
+cloak clean              → remove all data/markdown/ output (confirmation prompt)
+cloak clean --yes        → clean without confirmation
 ```
-
-### parse command behaviour
-- Accepts a file (`*.pdf`) or directory (recursively finds all `.pdf` files)
-- Does NOT show startup screen (removed in Session 8 — reduces noise in parse output)
-- `--no-review` flag skips Phase 9 deep review (`deep_review=False` passed to `parse()`)
-- Parses each PDF via `orchestration.parser_agent.parse(pdf, deep_review=not no_review)`
-- Collects errors per file — reports failures at the end, does not abort on first error
-
-### Package entry point (`pyproject.toml`)
-```toml
-[project.scripts]
-cloak = "cloak.cli.main:app"
-```
-
-### Dependencies
-- `typer>=0.12.0` (in pyproject.toml)
-- `rich` — for table display in `cloak list`
 
 ---
 
 ## 11 · quality/deep_review.py ✅ done — Phase 9
 
-**Purpose:** Post-pipeline deep quality review. Loads `gemma4:latest` after all pipeline models are unloaded, compares raw pdfplumber text (ground truth) vs final AI-processed markdown, writes actionable quality improvement report. See [[docs/DECISIONS.md]] §D27.
+**Purpose:** Post-pipeline deep quality review. Loads `gemma4:latest` after all pipeline models are unloaded, compares raw pdfplumber text vs final markdown, writes actionable quality improvement report. See [[docs/DECISIONS.md]] §D27.
 
 ### Entry point
 ```python
-from cloak.quality import deep_review as dr
-rev_path = dr.run(
-    pdf_path: Path,
-    pages: list,           # list[PageData] — still in memory after pipeline
-    final_markdown: str,
-    review_out: Path,      # {stem}_review.md path
-    console,               # rich Console
-) -> Path | None           # returns path written, or None if failed
+rev_path = dr.run(pdf_path, pages, final_markdown, review_out, console) -> Path | None
 ```
-
-### Internal functions
-```python
-_call(raw_text: str, final_md: str) -> str
-    # Truncates inputs to 10,000 chars each
-    # Calls DEEP_REVIEW_MODEL via daemon thread with DEEP_REVIEW_TIMEOUT
-    # Returns review text
-
-_unload() -> None
-    # POST keep_alive=0 to Ollama API for DEEP_REVIEW_MODEL
-    # Always called in finally block — model never left loaded
-```
-
-### Report structure
-```markdown
-# Quality Review — {pdf_name}
-**Model:** `gemma4:latest`  ·  **Pages reviewed:** N
-
----
-## Missing Content
-## Wrong or Missing Headings
-## Table Issues
-## Duplicate Content
-## Formatting Problems
-## Overall Assessment
-## Quality Score
-Score: X/10
-## Priority Fixes
-```
-
-### Memory strategy
-Called after `model_router.teardown_pdf()` — all pipeline models unloaded. `gemma4:latest` (9.6 GB) exceeds pure VRAM but Ollama places it automatically across GPU + CPU RAM. No explicit split management needed.
 
 ### Config
 ```python
-DEEP_REVIEW_MODEL   = "gemma4:latest"   # config.py
-DEEP_REVIEW_TIMEOUT = 600               # 10 min — CPU+GPU split is slower
+DEEP_REVIEW_MODEL   = "gemma4:latest"
+DEEP_REVIEW_TIMEOUT = 1200   # 20 min — bumped from 600s in Session 18 for gemma4:26b headroom
+DEEP_REVIEW_NUM_CTX = 8192
 ```
 
-### Error behaviour
-If `DEEP_REVIEW_MODEL` is not installed or call fails: prints warning, returns `None`. Parse output is unaffected — review is best-effort.
+### Report sections
+Missing Content · Wrong/Missing Headings · Table Issues · Duplicate Content · Formatting Problems · Overall Assessment · Quality Score (0–10) · Priority Fixes
+
+---
+
+## 12 · profiling/doc_profiler.py ✅ done (D28, D35 update)
+
+**Purpose:** Aggregate page profiles into `DocProfile`, generate `ParsePlan`. Runs after page_profiler, before any model load.
+
+### Key functions
+```python
+build_doc_profile(page_profiles: list[PageProfile], element_map: DoclingPageMap | None) -> DocProfile
+build_parse_plan(doc_profile: DocProfile, primary_viable: bool, use_docling: bool) -> ParsePlan
+run_docling_pass(pdf_path: Path) -> DoclingPageMap | None
+```
+
+### DocProfile
+```python
+@dataclass
+class DocProfile:
+    page_count:        int
+    type_distribution: dict[str, float]  # fraction per page type
+    vision_dependency: str               # "none" | "low" | "medium" | "high"
+    complexity_score:  float             # 0.0–1.0
+    size_tier:         str               # "small"(<50) | "medium"(50–200) | "large"(200–500) | "huge"(>500)
+    formula_count:     int               # D35: total FormulaItem elements across all pages
+```
+
+### ParsePlan
+```python
+@dataclass
+class ParsePlan:
+    model_tier:        str          # "none" | "fallback" | "primary"
+    max_rounds:        int          # adaptive from size_tier ± complexity_score
+    judge_sample_rate: float        # 0.1–1.0 — fraction of pages judged per round
+    use_docling:       bool         # True when DoclingPageMap available
+    use_math_ocr:      bool         # D35: True when formula_count ≥ MATH_FORMULA_THRESHOLD and pix2tex available
+    math_ocr_engine:   str          # D35: "pix2tex" | "none"
+```
+
+### Adaptive round budget
+| size_tier | base rounds | judge_sample_rate |
+|---|---|---|
+| small | 4 | 1.0 |
+| medium | 3 | 0.6 |
+| large | 2 | 0.3 |
+| huge | 1 | 0.1 |
+
+`complexity_score > 0.6` → +1 round; `< 0.3` → −1 round (min 1).
+
+### run_docling_pass
+Runs docling layout analysis with `do_ocr=False, device=cpu`. Sorts each page's elements by `(bbox_norm.y, bbox_norm.x)` for visual reading order (D36). Returns `None` on failure — pipeline falls back to heuristic profiles.
+
+Discards `PageHeader` / `PageFooter` elements (D29). Retains: `section_header`, `text`, `table`, `picture`, `footnote`, `formula`, `list_item`, `caption`, etc.
+
+---
+
+## 13 · extraction/math_ocr.py ✅ done (D35, Session 19)
+
+**Purpose:** pix2tex wrapper for LaTeX OCR on FormulaItem bbox crops. Called from `_extract_docling_page()` when `ParsePlan.use_math_ocr=True`.
+
+### Public API
+```python
+is_pix2tex_available() -> bool          # checks pix2tex import; cached
+pix2tex_equation(image: PIL.Image) -> str  # run LatexOCR on crop; returns LaTeX or ""
+unload_model() -> None                  # release LatexOCR from memory
+```
+
+### Load behaviour
+Singleton: `LatexOCR` model loaded on first call to `pix2tex_equation()`, cached for the session. Downloads ~100 MB on first use. Silent fail on `ImportError` — pipeline continues using docling text fallback.
+
+### Activation condition
+`ParsePlan.use_math_ocr = True` when:
+1. `DocProfile.formula_count >= MATH_FORMULA_THRESHOLD` (default 3) AND
+2. `is_pix2tex_available() == True`
+
+### Output format
+- pix2tex returns LaTeX → emitted as `$$\n{latex}\n$$` display block
+- pix2tex returns empty → fall back to `` `{docling_text}` `` inline code
+
+### Config
+```python
+MATH_OCR_ENGINE        = "pix2tex"   # engine identifier
+MATH_OCR_TIMEOUT       = 30          # seconds per equation crop
+MATH_FORMULA_THRESHOLD = 3           # min FormulaItem count to activate math OCR
+```
+
+### Dependencies
+- `pix2tex>=0.1.4` (in pyproject.toml)
+- `torch`, `timm`, `x-transformers`, `albumentations` (installed as pix2tex deps)
+- Not using Ollama — pure Python inference
+
+---
+
+## 14 · cloak/registry.py ✅ done
+
+**Purpose:** Lightweight document registry. Tracks all parsed PDFs with scores, timestamps, and status. Backed by `data/registry.json`.
+
+Used by `cloak list` to display parsed document inventory with quality scores and confidence flags.
+
+---
+
+## Planned
+
+### D38 · Slide deck per-slide VLM mode (planned)
+
+For PDFs where `image_heavy` fraction > 70% AND content is consistent with slide decks (1–3 figures per page, minimal pdfplumber text): render each slide as a full-page image and send to vision model with a slide-description prompt. Current approach tries to extract pdfplumber text (near-empty on slides) and falls back to prose descriptions — poor structure, no slide titles captured correctly.
+
+Expected impact: slide deck score 6.2 → ~8.5.

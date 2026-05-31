@@ -121,6 +121,7 @@ def _call_timed(
     think: bool = False,
     num_ctx: int = VISION_NUM_CTX,
     label: str = "",
+    json_format: bool = False,
 ) -> str:
     """
     Stream tokens from Ollama with live progress and stall detection.
@@ -129,6 +130,7 @@ def _call_timed(
     Stall detection fires after STALL_SECONDS with no new tokens — probes GPU OOM
     and Ollama state, then raises VisionTimeoutError with a human-readable reason.
     Hard timeout fires at `timeout` seconds regardless.
+    json_format=True passes format="json" to Ollama, enforcing valid JSON output.
     """
     chunks: list[str] = []
     token_count = 0
@@ -140,13 +142,16 @@ def _call_timed(
     def _worker() -> None:
         nonlocal token_count, last_token_at
         try:
-            for chunk in ollama.chat(
+            kwargs: dict[str, Any] = dict(
                 model=model,
                 messages=messages,
                 options=_thinking_options(think, num_ctx, temperature),
                 keep_alive=MODEL_KEEP_ALIVE,
                 stream=True,
-            ):
+            )
+            if json_format:
+                kwargs["format"] = "json"
+            for chunk in ollama.chat(**kwargs):
                 piece = chunk.message.content or ""
                 if piece:
                     chunks.append(piece)
@@ -238,21 +243,16 @@ Output as plain markdown. Do NOT use code fences (``` or ```markdown).
 Do NOT add meta-headers like "Visual Content:", "Concept Illustrated:", or "Description:"."""
 
 _JUDGE_PROMPT = """\
-You are a document QA reviewer.
-
-You are given:
-  1. The original page image
-  2. The extracted markdown (shown below)
+You are a document QA reviewer. Compare the page image with the extracted markdown below.
 
 Score how completely the markdown captures EVERYTHING visible on the page (0.0 to 10.0).
-Then list any content that is missing or incorrectly extracted.
-Finally decide the action:
-  "accept"   — score >= 8.0, extraction is good enough
-  "patch"    — score >= 5.0, specific gaps can be filled
-  "fallback" — score < 5.0, extraction failed, try a different model
+List any content that is missing, wrong, or out of order as gaps.
+Action: "accept" (score >= 8.0), "patch" (score >= 5.0), "fallback" (score < 5.0).
 
-Respond ONLY with valid JSON — no explanation, no markdown fences:
-{{"score": <float>, "gaps": [<string>, ...], "action": "<accept|patch|fallback>"}}
+You MUST respond with ONLY this JSON object — no other text, no markdown fences, no explanation:
+{{"score": 8.5, "gaps": ["missing table in section X", "figure caption absent"], "action": "accept"}}
+
+Fill in the real values from your assessment. Output the JSON object and nothing else.
 
 --- EXTRACTED MARKDOWN ---
 {markdown}"""
@@ -264,12 +264,13 @@ The document layout analyser detected these elements on this page:
 {element_checklist}
 
 Check the extracted markdown below against this checklist.
-For each element above, confirm whether it is present and correctly extracted.
-Score completeness 0.0 to 10.0 based on how many checklist items are satisfied.
-List only items that are missing or incorrect as gaps.
+Score completeness 0.0 to 10.0. List only missing or incorrect items as gaps.
+Action: "accept" (score >= 8.0), "patch" (score >= 5.0), "fallback" (score < 5.0).
 
-Respond ONLY with valid JSON — no explanation, no markdown fences:
-{{"score": <float>, "gaps": [<string>, ...], "action": "<accept|patch|fallback>"}}
+You MUST respond with ONLY this JSON object — no other text, no markdown fences, no explanation:
+{{"score": 8.5, "gaps": ["missing table in section X", "figure caption absent"], "action": "accept"}}
+
+Fill in the real values from your assessment. Output the JSON object and nothing else.
 
 --- EXTRACTED MARKDOWN ---
 {markdown}"""
@@ -304,22 +305,24 @@ Rules:
 - Capture ALL equations, even simple ones like x = 2 or F = ma"""
 
 _POSTER_PROMPT = """\
-You are transcribing a clinical flowchart or medical poster. Every word is medically significant.
+You are a transcription machine for a clinical flowchart or medical poster.
+Your ONLY job is to copy the text you see in the image. Do NOT add, invent, or improve anything.
 
-Rules:
-1. Transcribe ALL text visible — section headings, box labels, decision nodes, criteria, thresholds
-2. Use ## for major section headings (e.g. ## WHEN TO SUSPECT?, ## INVESTIGATIONS, ## SHOCK)
-3. Use ### for sub-headings within sections
-4. Use bullet points for list items within each section
-5. Show branching and flow using indentation:
-   - Parent condition or step
-     - Branch A (e.g. Improvement / No Improvement)
-       - Action or next step with its values
-6. Preserve ALL numbers, units, and comparison signs (>, <, ≥, ≤, %) EXACTLY as they appear
-7. Reproduce tables using markdown table syntax: | Column | Column |
-8. Include ALL text at the bottom of the page — disclaimers, copyright notices, dates, URLs
-9. Do NOT describe the flowchart — transcribe its content verbatim
-10. Output only the markdown. No preamble, no closing remarks, no code fences."""
+CRITICAL RULES — violations produce wrong clinical output:
+1. COPY ONLY: Write exactly what you see. If the image shows "RL 10-15ml/kg/hr", write "RL 10-15ml/kg/hr".
+2. DO NOT rewrite, correct, expand, or "improve" the content. Do NOT say "The provided content appears to be..." or generate your own version.
+3. DO NOT add information from your training data. Only text visible in the image.
+4. Use ## for major section headings (e.g. ## WHEN TO SUSPECT?, ## INVESTIGATIONS, ## SHOCK)
+5. Use ### for sub-headings within sections
+6. Use bullet points for list items
+7. Show branching using indentation:
+   - Parent step
+     - Branch condition (Improvement / No Improvement)
+       - Next step with exact values
+8. Preserve ALL numbers, units, signs (>, <, ≥, ≤, %) EXACTLY as shown — never change them
+9. Reproduce tables as markdown: | Column | Column |
+10. Include ALL text at the bottom — disclaimers, copyright, dates, URLs
+11. Output only the transcribed markdown. No preamble, no commentary, no code fences."""
 
 _REGION_PROMPTS = {
     "ecg":     _ECG_PROMPT,
@@ -345,7 +348,14 @@ def _strip_code_fences(text: str) -> str:
 _HALLUCINATION_RE = _re.compile(
     r'^(?:it seems|i notice|the description (?:appears|seems|provided)|'
     r'based on the partial|the image description you provided|'
-    r'the provided description|unfortunately|i (?:cannot|can\'t) (?:see|read|interpret))',
+    r'the provided description|unfortunately|i (?:cannot|can\'t) (?:see|read|interpret)|'
+    # Rewrite/correction patterns — model generates its own version instead of transcribing
+    r'the provided content (?:appears|seems)|'
+    r'the (?:following|content) (?:appears|seems) to be (?:fragmented|incorrect|incomplete)|'
+    r'below is a (?:structured|corrected|formatted|revised|cleaned)|'
+    r'here is a (?:structured|corrected|formatted|revised|cleaned)|'
+    r'i (?:have|\'ve) (?:restructured|reformatted|corrected|cleaned up)|'
+    r'this (?:appears|seems) to be a (?:fragmented|partial|incomplete))',
     _re.IGNORECASE,
 )
 
@@ -501,17 +511,20 @@ def judge_quality(
         "images":  [img_bytes],
     }]
 
-    # think=False: judge needs quick completeness assessment, not deep reasoning.
-    # think=True causes gemma4:26b to exhaust the full timeout in its thinking chain
-    # on dense documents (7K+ chars) without producing visible tokens.
+    # think=False: judge needs quick completeness assessment, not deep reasoning (D48).
+    # json_format=False: format="json" causes qwen3-vl to stall (0 tokens for 13+ min)
+    # because Ollama buffers the full response for grammar validation with vision input.
+    # JSON reliability is handled by explicit prompt template + robust extraction below.
     raw = _call_timed(model, messages, timeout, think=False, label="quality-judge")
 
     cleaned = raw.strip()
+    # Strip markdown code fences if present
     if cleaned.startswith("```"):
         cleaned = "\n".join(cleaned.splitlines()[1:])
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3].strip()
 
+    # Attempt 1: parse the whole response as JSON
     try:
         result = json.loads(cleaned)
         return {
@@ -520,15 +533,31 @@ def judge_quality(
             "action": str(result.get("action", "patch")),
         }
     except (json.JSONDecodeError, ValueError):
-        # D34: regex fallback chain — don't hard-floor at 0.0 on parse failure
-        m = _re.search(r'"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
-        if m:
-            score = min(10.0, float(m.group(1)))
-            return {"score": score, "gaps": ["partial JSON — score extracted by regex"],
-                    "action": "accept" if score >= 8.0 else "patch"}
-        m = _re.search(r'\b([0-9]+(?:\.[0-9]+)?)\s*/\s*10\b', raw)
-        if m:
-            score = min(10.0, float(m.group(1)))
-            return {"score": score, "gaps": ["text response — score extracted from X/10 format"],
-                    "action": "accept" if score >= 8.0 else "patch"}
-        return {"score": 5.0, "gaps": ["JSON parse failed — model response was not valid JSON"], "action": "patch"}
+        pass
+
+    # Attempt 2: extract a JSON object embedded anywhere in a prose response
+    # qwen3-vl sometimes wraps the JSON in explanation text
+    m = _re.search(r'\{[^{}]*"score"\s*:[^{}]*\}', raw, _re.DOTALL)
+    if m:
+        try:
+            result = json.loads(m.group(0))
+            return {
+                "score":  float(result.get("score", 0.0)),
+                "gaps":   list(result.get("gaps", [])),
+                "action": str(result.get("action", "patch")),
+            }
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # D34: regex fallback chain — extract score from partial or non-JSON response
+    m = _re.search(r'"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
+    if m:
+        score = min(10.0, float(m.group(1)))
+        return {"score": score, "gaps": ["partial JSON — score extracted by regex"],
+                "action": "accept" if score >= 8.0 else "patch"}
+    m = _re.search(r'\b([0-9]+(?:\.[0-9]+)?)\s*/\s*10\b', raw)
+    if m:
+        score = min(10.0, float(m.group(1)))
+        return {"score": score, "gaps": ["text response — score extracted from X/10 format"],
+                "action": "accept" if score >= 8.0 else "patch"}
+    return {"score": 5.0, "gaps": ["JSON parse failed — model response was not valid JSON"], "action": "patch"}

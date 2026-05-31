@@ -1,6 +1,6 @@
 ---
 type: session-log
-updated: 2026-05-31 (Session 26)
+updated: 2026-05-31 (Session 27)
 ---
 
 # Progress — cloak
@@ -10,6 +10,17 @@ updated: 2026-05-31 (Session 26)
 > | [[CLAUDE.md]] · [[ARCHITECTURE.md]] · [[MODULES.md]] · [[MODELS.md]] · [[DECISIONS.md]]
 
 ---
+
+## Session 27 — end of 2026-05-31
+
+- **Root cause identified: qwen3-vl:8b is wrong model for quality judge.** Extraction takes 132s (simple transcription). Judge takes 700s+ (requires reasoning/evaluation). Model does batch generation — 0 streaming tokens for hundreds of seconds, then emits all at once. Quality loop with 4 rounds = 47+ min per doc. Unusable.
+- **`format="json"` tried and reverted** — causes complete stall (819s, 0 tokens, empty response). Ollama buffers entire response for grammar validation with vision input. Worse than no format constraint.
+- **Judge prompts improved** — concrete JSON example in `_JUDGE_PROMPT` and `_JUDGE_GROUNDED_PROMPT`. Embedded JSON extraction added (attempt 2 in fallback chain finds JSON anywhere in prose response). Confirmed working: dengue round 3 returned 8.6/10 real score.
+- **VLM hallucination fixed** — `_POSTER_PROMPT` rewritten with "COPY ONLY" rules and explicit anti-rewrite instructions. `_strip_hallucination` extended with rewrite/correction patterns ("The provided content appears to be...", "Below is a structured corrected version", etc.).
+- **`json_format` param added to `_call_timed()`** — not used for judge (causes stall), available for future non-streaming use cases.
+- **Session ended early** — dengue parse stopped mid-run. Fixes not fully validated. Commit covers all code changes.
+- **Next action: redesign judge for poster_mode pages** — skip L4 VLM judge, use L1/L2 heuristic only. Instant, reliable, no model needed for pages that have pdfplumber text.
+- **Tests: 60/60.**
 
 ## Session 26 — end of 2026-05-31
 

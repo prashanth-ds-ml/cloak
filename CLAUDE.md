@@ -10,27 +10,49 @@ General-purpose. Local-only. No data leaves the machine.
 
 **First task:** run `pytest tests/ -q` — confirm still 60/60.
 
-**Then fix in order (all identified in Session 26):**
-1. **Fix judge JSON** — `qwen3-vl:8b` returns prose instead of JSON. Add `format: "json"` to `judge_quality()` Ollama call in `vision_tools.py`. Verify by parsing dengue and checking confidence report shows a real score (not 6.2 fallback).
-2. **Fix poster_mode detection for AF** — change `_detect_poster()` threshold from `< 8 elements` to `docling coverage < 50%`. AF has 63 docling elements but only 33.9% coverage → should fire poster_mode. Stroke has 84.7% → should not.
-3. **Fix hallucination filter** — AF figure 1 generated *"The user's input appears to be a mix of text and code..."*. Extend `_strip_hallucination()` in `vision_tools.py` with this pattern.
-4. **Investigate patch loop** — every doc stops with "Patch produced no changes". Check whether qwen3:14b tool-calling works correctly. May need to fix the PATCH prompt or tool definitions.
-5. **Re-run AF + stroke sequential** (one at a time) — verify all fixes produce real scores and correct clinical content.
+**Core problem to solve (identified Session 27):**
 
-**Key work from Session 26 (all committed):**
+`qwen3-vl:8b` is the wrong model for the quality judge. It takes **700s+ per judge call** (vs 132s for extraction) because evaluation requires reasoning while extraction is just transcription. With 4 rounds max, the quality loop takes 47+ min per doc — unusable.
+
+**Fix in this order:**
+
+1. **Redesign the quality judge for poster_mode pages** — for pages extracted by poster_mode, skip the VLM judge (L4) entirely. Use L1 + L2 only:
+   - L1: docling coverage (deterministic, instant)
+   - L2: pdfplumber word recall (no model, instant)
+   - These are reliable for poster docs because pdfplumber HAS the text (just in wrong spatial order)
+   - Only use L4 VLM judge for genuinely scanned/image-only pages with no pdfplumber text
+   - File to change: `cloak/quality/quality_judge.py` and `cloak/orchestration/parser_agent.py`
+
+2. **Fix poster_mode detection for AF** — `_detect_poster()` threshold is `< 8 docling text elements` but AF has 63 elements with only 33.9% text coverage. Change signal to: `docling_text_coverage < 0.50`. AF: 33.9% fires ✓. Stroke: 84.7% doesn't fire ✓.
+   - File: `cloak/orchestration/parser_agent.py` — `_detect_poster()`
+
+3. **Investigate patch loop** — every doc stops with "Patch produced no changes". qwen3:14b tool-calling may not be working. Run a single patch manually with debug output to see what the model returns.
+   - File: `cloak/orchestration/parser_agent.py` — `_run_patch_loop()`
+
+4. **Once judge is fast: run 5 ICMR STWs sequentially** and collect quality scores.
+
+**Key work from Session 26–27 (committed in Session 26, Session 27 not yet committed):**
+
+Session 26 (committed):
 - Model stack: gemma4:26b → qwen3-vl:8b (VLM) + qwen3:14b (LLM) — D49, D50
-- `unload_and_wait()` confirmed unload polling at phase boundaries — D50
-- `poster_mode` for clinical flowcharts: `_detect_poster()`, `_extract_poster_page()`, `poster_page()`, `_POSTER_PROMPT` — D51
-- Dengue: 75%→97% completeness, 1→21 headings, PLT `>10,000` → `<10,000`, DSS correct, albumin correct
-- `.cloak_local.json` updated to new models
+- `poster_mode`: `_detect_poster()`, `_extract_poster_page()`, `poster_page()`, `_POSTER_PROMPT` — D51
+- Dengue: 75%→97% completeness, 1→21 headings, critical clinical errors fixed
 
-**Tests baseline:** 60/60 passing (Session 26). Run `pytest tests/ -q` before writing any code.
+Session 27 (NOT YET COMMITTED — need to commit):
+- `format="json"` tried and reverted — causes 819s stall, model buffers entire response
+- Improved judge prompts (`_JUDGE_PROMPT`, `_JUDGE_GROUNDED_PROMPT`) — concrete JSON example
+- Robust JSON extraction (embedded JSON search) — attempt 2 in `judge_quality()`
+- Extended `_strip_hallucination` — catches VLM rewrite/correction patterns
+- Strengthened `_POSTER_PROMPT` — "COPY ONLY" rules, explicit anti-rewrite instructions
+- `json_format` param added to `_call_timed()` (not used for judge, available for future)
 
-**Known open issues (do NOT start coding until tests pass):**
-- Judge JSON: qwen3-vl:8b always fails JSON parse → all scores are 6.2 fallback → quality loop blind
-- Patch no-change: every doc stops early → no improvement beyond Round 1 extraction
-- poster_mode miss: AF (33.9% docling coverage) not detected → column mixing in output
-- Figure hallucination: AF logo produced fabricated text, not caught by filter
+**Tests baseline:** 60/60 passing (Session 27). Run `pytest tests/ -q` before writing any code.
+
+**Root cause summary (for context):**
+- qwen3-vl:8b: fast at transcription (132s), slow at evaluation (700s+) — wrong model for judge
+- Judge returns 0 streaming tokens for hundreds of seconds — batch generation, not streaming
+- Quality loop only works when judge is fast — VLM judge makes it unusable for poster docs
+- Heuristic judge (L1/L2) is the right approach for poster pages — instant, reliable, no model needed
 
 ---
 

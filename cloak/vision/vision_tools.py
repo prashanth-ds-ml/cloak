@@ -122,6 +122,7 @@ def _call_timed(
     num_ctx: int = VISION_NUM_CTX,
     label: str = "",
     json_format: bool = False,
+    cold_timeout: float | None = None,
 ) -> str:
     """
     Stream tokens from Ollama with live progress and stall detection.
@@ -131,6 +132,9 @@ def _call_timed(
     and Ollama state, then raises VisionTimeoutError with a human-readable reason.
     Hard timeout fires at `timeout` seconds regardless.
     json_format=True passes format="json" to Ollama, enforcing valid JSON output.
+    cold_timeout: if no tokens at all arrive within this many seconds, raise
+      VisionTimeoutError immediately — catches qwen3-vl batch-generation stalls
+      where the model processes internally but emits nothing until far too late.
     """
     chunks: list[str] = []
     token_count = 0
@@ -183,6 +187,16 @@ def _call_timed(
             reason = _stall_reason(model, token_count, since_last)
             raise VisionTimeoutError(
                 f"{model} stalled mid-generation ({reason}) — {token_count} tokens then silent {since_last:.0f}s"
+            )
+
+        # Cold stall: no tokens at all after cold_timeout seconds.
+        # qwen3-vl sometimes processes a page internally for minutes without
+        # emitting any streaming tokens (batch generation mode). cold_timeout
+        # aborts early so the pipeline falls back to pdfplumber/GLM-OCR quickly.
+        if cold_timeout is not None and token_count == 0 and elapsed >= cold_timeout:
+            reason = _stall_reason(model, 0, elapsed)
+            raise VisionTimeoutError(
+                f"{model} cold stall — no tokens in {elapsed:.0f}s — {reason}"
             )
 
         # Live progress update via registered callback
@@ -382,7 +396,8 @@ def full_page_extract(
         "images":  [img_bytes],
     }]
     return _strip_hallucination(_strip_code_fences(
-        _call_timed(model, messages, timeout, think=False, label="full-page extract")
+        _call_timed(model, messages, timeout, think=False, label="full-page extract",
+                    cold_timeout=_COLD_STALL_TIMEOUT)
     ))
 
 
@@ -465,8 +480,13 @@ def gap_informed_page(
     messages = [{"role": "user", "content": prompt, "images": [img_bytes]}]
     return _strip_hallucination(_strip_code_fences(
         _call_timed(model, messages, timeout, think=False,
-                    num_ctx=VISION_NUM_CTX, label="re-extract")
+                    num_ctx=VISION_NUM_CTX, label="re-extract",
+                    cold_timeout=_COLD_STALL_TIMEOUT)
     ))
+
+
+_COLD_STALL_TIMEOUT = 600.0   # abort if no tokens in 10 min — catches qwen3-vl batch stalls
+                              # successful extractions start streaming within 1-5 min
 
 
 def poster_page(
@@ -477,9 +497,11 @@ def poster_page(
     """
     Full-page VLM extraction for clinical flowcharts and poster-format PDFs (D51).
     Uses a specialized transcription prompt — not generic description.
-    Higher resolution (EXAM_MAX_IMAGE_PX) to read dense box text clearly.
+    Resolution capped at MAX_IMAGE_PX (1024) — EXAM_MAX_IMAGE_PX (1536) generates
+    too many visual tokens, causing qwen3-vl to enter batch-generation mode.
+    cold_timeout aborts if no streaming tokens after 10 min.
     """
-    img_bytes = _prepare_image(image, max_px=EXAM_MAX_IMAGE_PX)
+    img_bytes = _prepare_image(image, max_px=MAX_IMAGE_PX)
     messages = [{
         "role":    "user",
         "content": _POSTER_PROMPT,
@@ -487,7 +509,8 @@ def poster_page(
     }]
     return _strip_hallucination(_strip_code_fences(
         _call_timed(model, messages, timeout, think=False,
-                    num_ctx=VISION_NUM_CTX, label="poster")
+                    num_ctx=VISION_NUM_CTX, label="poster",
+                    cold_timeout=_COLD_STALL_TIMEOUT)
     ))
 
 

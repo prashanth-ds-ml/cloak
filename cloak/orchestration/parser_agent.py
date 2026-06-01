@@ -660,25 +660,34 @@ def _extract_text_page_vision(
     return "\n\n".join(p for p in parts if p)
 
 
-def _extract_poster_page(pg: PageData, model: str) -> str:
+def _extract_poster_page(
+    pg: PageData,
+    model: str,
+    ground_truth_text: str = "",
+) -> str:
     """
     D51: full-page VLM extraction for clinical flowcharts and poster-format PDFs.
-    Bypasses docling and pdfplumber — the VLM reads the rendered page image and
-    follows the visual branching structure that pdfplumber cannot reconstruct.
-    Falls back to pdfplumber text on vision failure.
+    Fallback chain (D52): VLM → GLM-OCR ground truth → pdfplumber.
+    GLM-OCR text is passed in from Phase 1b and used when VLM fails — it preserves
+    more clinical structure than raw pdfplumber for complex poster layouts.
     """
     if pg.image is None:
-        return _extract_text_page(pg)
+        return ground_truth_text or _extract_text_page(pg)
     try:
         md = vision_tools.poster_page(pg.image, model=model)
         model_router.mark_success(model)
-        return md
+        if md.strip():
+            return md
+        # VLM returned empty (hallucination stripped) → fall through to GLM-OCR
     except (vision_tools.VisionTimeoutError, vision_tools.VisionCallError) as exc:
         console.print(
             f"  [yellow]Poster vision failed page {pg.page_num}: {type(exc).__name__}"
-            f" — text fallback[/yellow]"
+            f" — GLM-OCR fallback[/yellow]"
         )
-        return _extract_text_page(pg)
+    # D52: prefer GLM-OCR ground truth over pdfplumber when VLM fails
+    if ground_truth_text.strip():
+        return ground_truth_text
+    return _extract_text_page(pg)
 
 
 def _extract_slide_page(
@@ -853,6 +862,7 @@ def _extract_by_route(
     slide_mode: bool = False,
     exam_mode: bool = False,
     poster_mode: bool = False,
+    ground_truth: dict[int, str] | None = None,
 ) -> str:
     """
     Phase 3: dispatch each page to its extraction strategy.
@@ -875,9 +885,10 @@ def _extract_by_route(
     for pg in pages:
         page_type = route_map.get(pg.page_num, "text_rich")
 
-        # D51: poster_mode — full VLM extraction, bypasses docling and pdfplumber entirely
+        # D51/D52: poster_mode — VLM extraction with GLM-OCR fallback
         if poster_mode and vision_available:
-            md = _extract_poster_page(pg, model)
+            gt = (ground_truth or {}).get(pg.page_num, "")
+            md = _extract_poster_page(pg, model, ground_truth_text=gt)
 
         # D39: exam_mode — bypass docling text for text_rich/mixed; use Mathpix or vision
         elif exam_mode and page_type in ("text_rich", "mixed") and (vision_available or True):
@@ -1524,6 +1535,7 @@ def parse(
                 slide_mode=plan.slide_mode,
                 exam_mode=plan.exam_mode,
                 poster_mode=plan.poster_mode,
+                ground_truth=ground_truth,
             )
         finally:
             _vt.set_progress_callback(None)

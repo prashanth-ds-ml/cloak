@@ -328,6 +328,40 @@ def extract_table_glm(image: Image.Image) -> str:
     return value
 
 
+def build_ground_truth_text(
+    pages: list,          # list[PageData]
+    on_progress=None,     # optional callable(page_num: int) for UI updates
+) -> dict[int, str]:
+    """
+    Run GLM-OCR on every page to build a reliable text baseline (D52).
+
+    GLM-OCR is #1 on OmniDocBench — its output is the ground truth that the
+    heuristic judge compares extracted markdown against, replacing the slow VLM judge.
+
+    Falls back to pdfplumber text when GLM-OCR is unavailable or fails on a page.
+    Returns {page_num: text} for all pages.
+    """
+    glm_available = is_glm_ocr_available()
+    result: dict[int, str] = {}
+
+    for pg in pages:
+        page_num = pg.page_num
+        if on_progress:
+            on_progress(page_num)
+
+        if glm_available and getattr(pg, "image", None) is not None:
+            try:
+                result[page_num] = _ocr_page_glm(pg.image)
+                continue
+            except OCRError:
+                pass   # fall through to pdfplumber
+
+        # Fallback: pdfplumber text (less accurate but always available)
+        result[page_num] = getattr(pg, "text", "") or ""
+
+    return result
+
+
 def is_available() -> bool:
     """Return True if at least one OCR engine (GLM-OCR, Surya, or Tesseract) is ready."""
     return is_glm_ocr_available() or is_surya_available() or _is_tesseract_available()

@@ -428,6 +428,53 @@ def _run_patch_loop(
     return current_draft
 
 
+# ── Phase 5: Gap-informed re-extraction (D52) ─────────────────────────────────
+
+def _run_gap_informed_extract(
+    pages: list[PageData],
+    route_map: dict[int, str],
+    gaps: list[str],
+    plan,           # ParsePlan
+    vision_available: bool,
+    images_dir: Path | None = None,
+    element_map: DoclingPageMap | None = None,
+) -> str:
+    """
+    D52: Re-run full-page VLM extraction with the gap list as explicit context.
+
+    Replaces the patch loop. Instead of trying to surgically fill text gaps,
+    re-extracts problem pages entirely using a prompt that names exactly what was missed.
+    The VLM uses its visual understanding to find and include the missing content.
+
+    Returns the re-extracted markdown, or "" if VLM is unavailable.
+    """
+    if not vision_available or not gaps:
+        return ""
+
+    model = model_router.get_vision_model()
+    parts: list[str] = []
+
+    for pg in pages:
+        if pg.image is None:
+            parts.append(pg.text.strip())
+            continue
+        try:
+            md = vision_tools.gap_informed_page(
+                pg.image, gaps, model=model,
+                poster_mode=plan.poster_mode,
+            )
+            model_router.mark_success(model)
+        except (vision_tools.VisionTimeoutError, vision_tools.VisionCallError) as exc:
+            console.print(
+                f"  [yellow]Re-extract failed page {pg.page_num}: {type(exc).__name__}[/yellow]"
+            )
+            md = ""
+
+        parts.append(md if md else pg.text.strip())
+
+    return "\n\n---\n\n".join(p for p in parts if p)
+
+
 # ── Docling extraction helpers ────────────────────────────────────────────────
 
 def _crop_normalized(
@@ -759,8 +806,15 @@ def _detect_poster(pages: list[PageData], element_map: DoclingPageMap | None) ->
             e for e in elements
             if e.label in ("text", "section_header", "list_item", "paragraph")
         ]
-        # Lots of pdfplumber text but very few docling text elements = visual flowchart layout
-        if len(pg.text) > 800 and len(text_elements) < 8:
+        if len(pg.text) < 500:
+            continue
+        # Signal A: very few docling elements despite lots of pdfplumber text
+        if len(text_elements) < 8:
+            return True
+        # Signal B: docling coverage < 50% of pdfplumber text (D52) — catches AF-type docs
+        # where docling finds many short box-label elements but misses 66% of content
+        docling_chars = sum(len(e.text) for e in text_elements)
+        if docling_chars / len(pg.text) < 0.50:
             return True
     return False
 
@@ -1394,6 +1448,28 @@ def parse(
     plan_str  = f"  [dim][{doc_profile.size_tier} · {plan.max_rounds}r · {int(plan.judge_sample_rate * 100)}%][/dim]"
     ui.done(type_summary + docling_str + flag_str + plan_str)
 
+    # ── Phase 1b: GLM-OCR ground truth pass (D52) ─────────────────────────────
+    # Run GLM-OCR on all pages to build a reliable text baseline for the heuristic
+    # judge. This replaces the slow VLM judge (700s+) with instant text comparison.
+    ui.begin("1b", "Ground Truth")
+    from cloak.extraction.ocr_tools import build_ground_truth_text, is_glm_ocr_available
+    ground_truth: dict[int, str] = {}
+    if is_glm_ocr_available() and model_router.is_ollama_available():
+        _gt_pages_done = [0]
+        def _gt_progress(page_num: int) -> None:
+            _gt_pages_done[0] += 1
+            console.print(
+                f"       [dim]GLM-OCR page {_gt_pages_done[0]}/{len(pages)} ...[/dim]",
+                end="\r",
+            )
+        ground_truth = build_ground_truth_text(pages, on_progress=_gt_progress)
+        gt_pages = sum(1 for v in ground_truth.values() if v.strip())
+        ui.done(f"GLM-OCR {gt_pages}/{len(pages)} pages · {sum(len(v) for v in ground_truth.values()):,} chars")
+    else:
+        # Fallback: use pdfplumber text as ground truth
+        ground_truth = {pg.page_num: pg.text or "" for pg in pages}
+        ui.done("pdfplumber fallback (GLM-OCR unavailable)", skip=True)
+
     # ── Phase 2: Model staging — probe based on ParsePlan.model_tier ──────────
     ui.begin("2", "Route")
     model_router.reset()
@@ -1501,13 +1577,14 @@ def parse(
         conf_path = _confidence_path(out_path)
         out_path.write_text(postprocess.run(markdown), encoding="utf-8")
 
-        # Run heuristic judge on all pages (no vision needed — word-overlap only)
+        # Run heuristic judge on all pages using GLM-OCR ground truth (D52)
         heur_scores: list[quality_judge.PageScore] = [
             quality_judge.heuristic_judge(
                 page_num=pg.page_num,
-                page_text=pg.text,
+                page_text=ground_truth.get(pg.page_num, pg.text or ""),
                 extracted_md=markdown,
                 round_num=1,
+                page_elements=element_map.get(pg.page_num) if element_map else None,
             )
             for pg in pages
         ]
@@ -1544,25 +1621,23 @@ def parse(
         _registry.save(_reg, _ws)
         return markdown
 
-    # ── Phases 5–6: Judge + Patch loop — no re-extraction (D19) ──────────────
+    # ── Phases 5–6: Heuristic judge (D52) + Gap-informed re-extraction ──────────
+    # D52: judge uses GLM-OCR ground truth — instant, no VLM needed.
+    # D52: Phase 6 re-extracts with gap context instead of patching.
     best = RoundResult(
         round_num=0, markdown=markdown, score=0.0, gaps=[], action="patch", page_scores=[]
     )
-    messages: list[dict] = [{"role": "system", "content": _PATCH_SYSTEM}]
-    # Pages that scored ≥ JUDGE_SKIP_THRESHOLD are not re-judged in later rounds.
     carryover: dict[int, quality_judge.PageScore] = {}
-
     _max_rounds = plan.max_rounds
 
     for round_num in range(1, _max_rounds + 1):
         ui.round_header(round_num, _max_rounds)
 
-        # Phase 5: Judge — skip already-excellent pages from round 1 onward
-        model_router.before_vision_phase()
+        # Phase 5: Heuristic judge using GLM-OCR ground truth (D52)
+        # No VLM call — compares extracted markdown against GLM-OCR text baseline.
         judge_t0 = time.monotonic()
         pages_not_carried = [pg for pg in pages if pg.page_num not in carryover]
 
-        # Adaptive sampling (D28): prioritise visual / complex pages
         if plan.judge_sample_rate < 1.0:
             import random as _rand
             n_sample  = max(1, int(len(pages_not_carried) * plan.judge_sample_rate))
@@ -1574,58 +1649,49 @@ def parse(
         else:
             pages_to_judge = pages_not_carried
 
-        skipped = len(pages) - len(pages_to_judge) - len(carryover)
+        new_scores: list[quality_judge.PageScore] = []
+        for pg in pages_to_judge:
+            # Use GLM-OCR ground truth when available; fall back to pdfplumber
+            gt_text = ground_truth.get(pg.page_num, pg.text or "")
+            page_elements = element_map.get(pg.page_num) if element_map else None
 
-        # D33: only call vision for pages that actually have visual content
-        vision_pages    = [pg for pg in pages_to_judge if _needs_vision_map.get(pg.page_num, True)]
-        heuristic_pages = [pg for pg in pages_to_judge if not _needs_vision_map.get(pg.page_num, True)]
+            if len(gt_text.strip()) > 50:
+                # Reliable ground truth → heuristic judge is accurate (D52)
+                new_scores.append(quality_judge.heuristic_judge(
+                    page_num=pg.page_num,
+                    page_text=gt_text,
+                    extracted_md=markdown,
+                    round_num=round_num,
+                    page_elements=page_elements,
+                    poster_mode=plan.poster_mode,
+                ))
+            elif vision_available and pg.image is not None:
+                # No ground truth + visual page → VLM judge (rare: scanned with failed OCR)
+                model_router.before_vision_phase()
+                new_scores.append(quality_judge.judge(
+                    page_num=pg.page_num,
+                    page_image=pg.image,
+                    extracted_md=markdown,
+                    round_num=round_num,
+                    model=model_router.get_vision_model(),
+                    page_elements=page_elements,
+                ))
+            else:
+                # Last resort: pdfplumber text
+                new_scores.append(quality_judge.heuristic_judge(
+                    page_num=pg.page_num,
+                    page_text=pg.text or "",
+                    extracted_md=markdown,
+                    round_num=round_num,
+                    page_elements=page_elements,
+                    poster_mode=plan.poster_mode,
+                ))
 
-        with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-            desc = f"Judging {len(pages_to_judge)}/{len(pages)} page(s)"
-            n_carried = len(carryover)
-            if n_carried:
-                desc += f" · {n_carried} carried (≥{JUDGE_SKIP_THRESHOLD:.0f})"
-            if skipped > 0:
-                desc += f" · {skipped} sampled out"
-            if heuristic_pages:
-                desc += f" · {len(heuristic_pages)} heuristic"
-            judge_task = p.add_task(desc + " ...", total=None)
-
-            def _judge_token(tok: int, elapsed: float, since: float, lbl: str) -> None:
-                stall = f"  [yellow]⚠ no tokens {since:.0f}s[/yellow]" if since > 15 else ""
-                p.update(judge_task, description=f"[cyan]{lbl}[/cyan]  [dim]{tok:,} tok · {elapsed:.0f}s[/dim]{stall}")
-
-            from cloak.vision import vision_tools as _vt_judge
-            _vt_judge.set_progress_callback(_judge_token)
-            try:
-                new_scores: list[quality_judge.PageScore] = []
-                # Heuristic judge: no vision call, word-overlap + structure score
-                for pg in heuristic_pages:
-                    new_scores.append(quality_judge.heuristic_judge(
-                        page_num=pg.page_num,
-                        page_text=pg.text,
-                        extracted_md=markdown,
-                        round_num=round_num,
-                    ))
-                # Vision judge: only for image_heavy / mixed / scanned pages
-                for pg in vision_pages:
-                    new_scores.append(quality_judge.judge(
-                        page_num=pg.page_num,
-                        page_image=pg.image,
-                        extracted_md=markdown,
-                        round_num=round_num,
-                        model=model_router.get_vision_model(),
-                    ))
-            finally:
-                _vt_judge.set_progress_callback(None)
-
-        # Carry over high-scoring pages so they aren't re-judged next round
         judged_nums = {ps.page_num for ps in new_scores}
         for ps in new_scores:
             if ps.score >= JUDGE_SKIP_THRESHOLD:
                 carryover[ps.page_num] = ps
 
-        # Gap B: exclude carryover pages already in new_scores to avoid double-counting
         page_scores = new_scores + [ps for ps in carryover.values() if ps.page_num not in judged_nums]
         avg_score, all_gaps, action = quality_judge.aggregate_page_results(page_scores)
 
@@ -1640,41 +1706,35 @@ def parse(
         if action == "accept" or round_num == _max_rounds:
             break
 
-        # Phase 6: Patch — skip with a clear warning if Ollama is unreachable
+        # Phase 6: Gap-informed re-extraction (D52) — replaces patch loop
+        if not vision_available:
+            console.print("  [dim]Re-extraction skipped — no vision model available[/dim]")
+            break
         if not model_router.is_ollama_available():
-            console.print(
-                "  [red]✗[/red]  [bold cyan]6[/bold cyan]  [bold]Patch[/bold]"
-                "  [red]Ollama unreachable — patch skipped. "
-                "Is Ollama running? Run: ollama serve[/red]"
-            )
+            console.print("  [red]Ollama unreachable — re-extraction skipped[/red]")
             break
 
-        model_router.before_orchestrator_phase()
-        patch_t0 = time.monotonic()
+        model_router.before_vision_phase()   # ensure VLM is loaded for re-extraction
+        reextract_t0 = time.monotonic()
         with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as p:
-            p.add_task(f"Patching {len(all_gaps)} gap(s) ...", total=None)
-            messages = context_manager.compress_history(messages)
-            updated = _run_patch_loop(
-                pages, markdown, all_gaps, messages,
+            p.add_task(f"Re-extracting with {len(all_gaps)} gap(s) ...", total=None)
+            updated = _run_gap_informed_extract(
+                pages, route_map, all_gaps, plan, vision_available,
                 images_dir=images_dir, element_map=element_map,
             )
 
-        pre_patch_len = len(markdown)
-        patch_changed = updated != markdown
-        if not _content_loss_ok(markdown, updated):
-            console.print(
-                f"  [red]Content-loss guard triggered "
-                f"({len(markdown):,}→{len(updated):,} chars) — reverting[/red]"
-            )
-        else:
+        pre_len = len(markdown)
+        if updated and _content_loss_ok(markdown, updated):
             markdown = updated
-
-        ui.patch_line(pre_patch_len, len(markdown), time.monotonic() - patch_t0)
-
-        if not patch_changed:
-            console.print(
-                "  [dim]Patch produced no changes — stopping early[/dim]"
-            )
+            ui.patch_line(pre_len, len(markdown), time.monotonic() - reextract_t0)
+        else:
+            if updated:
+                console.print(
+                    f"  [red]Re-extraction content-loss guard "
+                    f"({pre_len:,}→{len(updated):,} chars) — reverting[/red]"
+                )
+            else:
+                console.print("  [dim]Re-extraction produced no output — stopping[/dim]")
             break
 
     # ── Phase 8 + 8.5: Post-process then write ───────────────────────────────

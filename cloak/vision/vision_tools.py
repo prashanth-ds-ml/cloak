@@ -439,6 +439,36 @@ def exam_page(
     ))
 
 
+def gap_informed_page(
+    image: Image.Image,
+    gaps: list[str],
+    model: str = VISION_PRIMARY,
+    timeout: float = VISION_TIMEOUT,
+    poster_mode: bool = False,
+) -> str:
+    """
+    D52: Re-extract a page with the judge's gap list as explicit context.
+
+    The gap list tells the model exactly what the previous extraction missed.
+    Uses poster prompt rules for flowchart/poster pages, extract prompt otherwise.
+    Higher resolution (EXAM_MAX_IMAGE_PX) regardless — gaps are often in dense areas.
+    """
+    gap_lines = "\n".join(f"- {g}" for g in gaps[:15])
+    base_rules = _POSTER_PROMPT if poster_mode else _EXTRACT_PROMPT
+    prompt = (
+        f"The previous extraction of this page was incomplete. "
+        f"These specific items were missing or wrong:\n{gap_lines}\n\n"
+        f"Re-extract the FULL page ensuring every missing item above is included.\n\n"
+        f"{base_rules}"
+    )
+    img_bytes = _prepare_image(image, max_px=EXAM_MAX_IMAGE_PX)
+    messages = [{"role": "user", "content": prompt, "images": [img_bytes]}]
+    return _strip_hallucination(_strip_code_fences(
+        _call_timed(model, messages, timeout, think=False,
+                    num_ctx=VISION_NUM_CTX, label="re-extract")
+    ))
+
+
 def poster_page(
     image: Image.Image,
     model: str = VISION_PRIMARY,

@@ -212,6 +212,10 @@ def build_parse_plan(
         model_tier = "fallback"
     if poster and model_tier == "fallback" and primary_viable:
         model_tier = "primary"
+    # D52: poster_mode caps at 2 rounds — extract once, re-extract once if needed.
+    # More rounds oscillate without converging (VLM output is variable).
+    if poster:
+        max_rounds = min(max_rounds, 2)
 
     return ParsePlan(
         model_tier        = model_tier,
@@ -246,6 +250,7 @@ def run_docling_pass(pdf_path: Path) -> DoclingPageMap | None:
             AcceleratorDevice,
             AcceleratorOptions,
             PdfPipelineOptions,
+            TableStructureOptions,
         )
         from docling.document_converter import DocumentConverter, PdfFormatOption
     except ImportError:
@@ -254,6 +259,10 @@ def run_docling_pass(pdf_path: Path) -> DoclingPageMap | None:
     try:
         pipeline_opts = PdfPipelineOptions(
             do_ocr=False,
+            do_table_structure=True,                                     # D52: enable TableFormer
+            table_structure_options=TableStructureOptions(
+                do_cell_matching=True,                                   # recover cell boundaries
+            ),
             accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
         )
         converter = DocumentConverter(
@@ -342,13 +351,25 @@ def _add_item(item: object, doc: object, element_map: DoclingPageMap) -> None:
         except Exception:
             table_md = ""
 
+    # D52: extract caption text for pictures and tables (was always empty before)
+    caption_text = ""
+    try:
+        captions = getattr(item, "captions", None)
+        if captions:
+            caption_text = " ".join(
+                c.text for c in captions
+                if hasattr(c, "text") and getattr(c, "text", "")
+            ).strip()
+    except Exception:
+        pass
+
     el = DoclingElement(
         label     = label_val,
         text      = text,
         level     = level,
         bbox_norm = bbox_norm,
         table_md  = table_md,
-        caption   = "",
+        caption   = caption_text,
     )
 
     if page_num not in element_map:

@@ -86,6 +86,7 @@ def _compute_structure_score(markdown: str) -> float:
 def docling_coverage_score(
     page_elements: list[DoclingElement],  # type: ignore[valid-type]
     extracted_md: str,
+    poster_mode: bool = False,
 ) -> tuple[float, list[str]]:
     """
     L1 judge: verify docling-detected elements appear in extracted markdown.
@@ -107,13 +108,18 @@ def docling_coverage_score(
         "text":           1.0,
         "list_item":      0.8,
     }
+    # In poster_mode, pictures are logos/decorative images — not clinical content.
+    # The flowchart body is extracted as text, not as image links. Skip picture
+    # penalty so logos don't drag down the score for good text extraction.
+    if poster_mode:
+        weights["picture"] = 0.0
+
     total_weight = 0.0
     found_weight = 0.0
     gaps: list[str] = []
 
-    # Count expected vs found by element type
     from collections import Counter
-    expected = Counter(el.label for el in page_elements if el.label in weights)
+    expected = Counter(el.label for el in page_elements if el.label in weights and weights[el.label] > 0)
 
     for label, count in expected.items():
         w = weights.get(label, 1.0)
@@ -157,6 +163,7 @@ def heuristic_judge(
     round_num: int,
     model: str = "heuristic",
     page_elements: list | None = None,   # DoclingElement list for L1 (optional)
+    poster_mode: bool = False,           # D52: skip picture penalty for poster pages
 ) -> PageScore:
     """
     L2 judge: word recall + hallucination rate against pdfplumber ground truth (D33, D47).
@@ -194,7 +201,8 @@ def heuristic_judge(
     coverage_score: float | None = None
     judge_level = "L2"
     if page_elements:
-        coverage_score, l1_gaps = docling_coverage_score(page_elements, extracted_md)
+        coverage_score, l1_gaps = docling_coverage_score(page_elements, extracted_md,
+                                                          poster_mode=poster_mode)
         gaps.extend(l1_gaps)
         # Blend: coverage acts as a floor — if L1 says 60% of elements missing, cap score
         coverage_as_score = coverage_score * 10.0

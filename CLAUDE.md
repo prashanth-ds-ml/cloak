@@ -10,49 +10,60 @@ General-purpose. Local-only. No data leaves the machine.
 
 **First task:** run `pytest tests/ -q` — confirm still 60/60.
 
-**Core problem to solve (identified Session 27):**
+**Architecture for Session 28: Ground-truth-first pipeline (D52)**
 
-`qwen3-vl:8b` is the wrong model for the quality judge. It takes **700s+ per judge call** (vs 132s for extraction) because evaluation requires reasoning while extraction is just transcription. With 4 rounds max, the quality loop takes 47+ min per doc — unusable.
+The direction is fully designed and documented. Implement in this order:
 
-**Fix in this order:**
+**1. Install camelot:**
+```powershell
+pip install camelot-py[cv]
+```
 
-1. **Redesign the quality judge for poster_mode pages** — for pages extracted by poster_mode, skip the VLM judge (L4) entirely. Use L1 + L2 only:
-   - L1: docling coverage (deterministic, instant)
-   - L2: pdfplumber word recall (no model, instant)
-   - These are reliable for poster docs because pdfplumber HAS the text (just in wrong spatial order)
-   - Only use L4 VLM judge for genuinely scanned/image-only pages with no pdfplumber text
-   - File to change: `cloak/quality/quality_judge.py` and `cloak/orchestration/parser_agent.py`
+**2. Enable docling TableFormer + captions in `doc_profiler.py`:**
+```python
+from docling.datamodel.pipeline_options import TableStructureOptions
+PdfPipelineOptions(
+    do_ocr=False,
+    do_table_structure=True,
+    table_structure_options=TableStructureOptions(do_cell_matching=True),
+    accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+)
+```
+Also populate `caption` field in `_add_item()` from docling item.
 
-2. **Fix poster_mode detection for AF** — `_detect_poster()` threshold is `< 8 docling text elements` but AF has 63 elements with only 33.9% text coverage. Change signal to: `docling_text_coverage < 0.50`. AF: 33.9% fires ✓. Stroke: 84.7% doesn't fire ✓.
-   - File: `cloak/orchestration/parser_agent.py` — `_detect_poster()`
+**3. Run GLM-OCR on ALL pages (not just scanned) in Phase 1 — `doc_profiler.py`:**
+- After docling pass, call `extract_glm_page(page_image)` for every page
+- Store as `ground_truth_text: dict[int, str]` in a new `GroundTruthMap` dataclass
+- This is the text baseline for the judge — no VLM needed
 
-3. **Investigate patch loop** — every doc stops with "Patch produced no changes". qwen3:14b tool-calling may not be working. Run a single patch manually with debug output to see what the model returns.
-   - File: `cloak/orchestration/parser_agent.py` — `_run_patch_loop()`
+**4. Replace VLM judge with heuristic judge using GLM-OCR baseline — `quality_judge.py`:**
+```
+score = 0.6 * word_recall + 0.3 * element_coverage + 0.1 * (1 - hallucination_rate)
+word_recall      = len(glm_words ∩ md_words) / len(glm_words)
+element_coverage = found_elements / expected_elements (from docling)
+hallucination    = len(md_words - glm_words) / len(md_words)
+```
+Produces gap_report of specific missing content — actionable for re-extraction.
 
-4. **Once judge is fast: run 5 ICMR STWs sequentially** and collect quality scores.
+**5. Replace patch loop with gap-informed re-extraction:**
+- If score < 8.0: reload qwen3-vl:8b, re-run extraction on low-scoring pages WITH gap_report in prompt
+- "Previous extraction missed these sections: [X, Y, Z]. Make sure to include them."
+- No tool-calling, no patching — just a better extraction pass
 
-**Key work from Session 26–27 (committed in Session 26, Session 27 not yet committed):**
+**6. Fix poster_mode detection for AF:**
+Change `_detect_poster()` to use coverage ratio instead of element count:
+`docling_text_coverage = sum(len(e.text) for text_elements) / len(pg.text)`
+Fire poster_mode when coverage < 0.50. AF: 33.9% fires ✓. Stroke: 84.7% doesn't ✓.
 
-Session 26 (committed):
-- Model stack: gemma4:26b → qwen3-vl:8b (VLM) + qwen3:14b (LLM) — D49, D50
-- `poster_mode`: `_detect_poster()`, `_extract_poster_page()`, `poster_page()`, `_POSTER_PROMPT` — D51
-- Dengue: 75%→97% completeness, 1→21 headings, critical clinical errors fixed
+**7. Run 5 ICMR STWs to validate:** dengue, cardiology_af, neurology_stroke, cardiology_stemi, neonatology_sepsis
 
-Session 27 (NOT YET COMMITTED — need to commit):
-- `format="json"` tried and reverted — causes 819s stall, model buffers entire response
-- Improved judge prompts (`_JUDGE_PROMPT`, `_JUDGE_GROUNDED_PROMPT`) — concrete JSON example
-- Robust JSON extraction (embedded JSON search) — attempt 2 in `judge_quality()`
-- Extended `_strip_hallucination` — catches VLM rewrite/correction patterns
-- Strengthened `_POSTER_PROMPT` — "COPY ONLY" rules, explicit anti-rewrite instructions
-- `json_format` param added to `_call_timed()` (not used for judge, available for future)
+**Key work committed this session (Session 28):**
+- D52 documented in DECISIONS.md
+- data/samples/poster/ cleaned (duplicates removed)
+- data/batch_logs/ added to .gitignore
+- Session 27 code changes committed (judge prompts, hallucination filter, POSTER_PROMPT)
 
-**Tests baseline:** 60/60 passing (Session 27). Run `pytest tests/ -q` before writing any code.
-
-**Root cause summary (for context):**
-- qwen3-vl:8b: fast at transcription (132s), slow at evaluation (700s+) — wrong model for judge
-- Judge returns 0 streaming tokens for hundreds of seconds — batch generation, not streaming
-- Quality loop only works when judge is fast — VLM judge makes it unusable for poster docs
-- Heuristic judge (L1/L2) is the right approach for poster pages — instant, reliable, no model needed
+**Tests baseline:** 60/60 passing. Run `pytest tests/ -q` before writing any code.
 
 ---
 
@@ -108,15 +119,16 @@ Only update ARCHITECTURE.md, MODELS.md, MODULES.md when those specific things ac
 
 | Layer | Tool |
 |---|---|
-| Vision LLM | `qwen3-vl:8b` via Ollama — 6.1 GB, full GPU, figures + image pages + L4 judge (D49) |
-| Vision fallback | `qwen3-vl:4b` via Ollama — 3.3 GB, full GPU (D49) |
-| Text LLM | `qwen3:14b` via Ollama — 9.0 GB, ~8 GB GPU + 1 GB RAM, FORMAT + PATCH + deep review (D49) |
-| OCR primary | `glm-ocr` via Ollama — 2.2 GB, #1 OmniDocBench V1.5, always-resident (D45) |
+| Phase 1 ground truth | `glm-ocr` via Ollama — 2.2 GB, runs on ALL pages, text baseline for judge (D52) |
+| Layout + structure | `docling` — TableFormer, element map, captions, reading order (D29, D36, D52) |
+| PDF → data | pymupdf, pdfplumber, camelot-py (grid tables), pillow |
+| VLM extraction | `qwen3-vl:8b` via Ollama — 6.1 GB, full GPU, Phase 3 extraction only (D49) |
+| VLM fallback | `qwen3-vl:4b` via Ollama — 3.3 GB, full GPU, Phase 6 image judge (D49, D52) |
+| Text LLM | `qwen3:14b` via Ollama — 9.0 GB, ~8 GB GPU + 1 GB RAM, deep review (D49) |
+| Quality judge | heuristic — GLM-OCR word recall + docling element coverage, no model (D52) |
 | OCR fallback | `surya` — reading-order-aware, GPU-accelerated (D30) |
 | OCR last resort | tesseract + pytesseract (D22) |
-| Layout + structure | `docling` — element map, heading hierarchy, reading order (D29, D36) |
 | Math OCR | `pix2tex` — FormulaItem bbox crops → LaTeX `$$...$$` (D35) |
-| PDF → data | pymupdf, pdfplumber, pillow |
 | System check | psutil, nvidia-smi |
 | UI | rich, typer |
 

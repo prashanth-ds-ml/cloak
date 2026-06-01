@@ -19,9 +19,10 @@ data/images/
 data/markdown/
 !data/.gitkeep
 
-# Logs
+# Logs and batch output
 logs/*.log
 !logs/.gitkeep
+data/batch_logs/
 
 # Workspace registry (local state — not committed)
 .cloak/

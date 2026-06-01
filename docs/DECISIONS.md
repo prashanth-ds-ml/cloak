@@ -1146,3 +1146,76 @@ This mismatch occurs when flowchart boxes and arrows are rendered as PDF vector 
 **See:** D38 (slide_mode pattern this follows) D39 (exam_mode pattern)
 
 ---
+
+## D52 — Ground-truth-first pipeline: GLM-OCR baseline + heuristic judge (Session 28)
+
+**Decision:** Replace the VLM-as-judge approach with a ground-truth-first pipeline. GLM-OCR runs on every page in Phase 1 (not just scanned pages), producing an accurate text baseline. The quality judge compares extracted markdown against this baseline using text recall and element coverage — no model calls required for text-content pages. VLM judging is reserved for genuinely image-only content where no text baseline exists.
+
+**Why the previous approach failed:**
+- qwen3-vl:8b takes 700s+ per judge call (evaluation requires reasoning, extraction is transcription)
+- format="json" caused 819s stall — model buffers entire response for grammar validation with vision input
+- Patch loop never worked — structural gaps cannot be fixed by text patching; re-extraction is better
+- The VLM judge was used for poster pages that have full pdfplumber/GLM-OCR text — wasteful
+
+**New pipeline phases:**
+
+Phase 1 — Deep profiling (CPU only, no Ollama VLM):
+  - docling: ElementInventory, TableFormer-enabled table structure, picture captions, reading order
+  - GLM-OCR (2.2 GB, stays loaded): full-page text extraction on ALL pages — ground_truth_text[page]
+  - pdfplumber: raw text + tables (cross-check and supplement)
+  - camelot (optional): lattice algorithm for grid-line tables (CHA2DS2-VASc type)
+  - Output: GroundTruthMap = {structure, ground_truth_text, tables, reading_order} per page
+
+Phase 2 — Classify (no model):
+  - page types from GroundTruthMap
+  - poster detection uses docling coverage ratio (GLM-OCR coverage vs pdfplumber text)
+
+Phase 3 — Extract (qwen3-vl:8b, loaded then UNLOADED):
+  - docling path: text/table pages
+  - poster_mode: qwen3-vl:8b with _POSTER_PROMPT
+  - image_heavy: qwen3-vl:8b with _EXTRACT_PROMPT
+  - scanned: glm-ocr (already loaded)
+
+Phase 4 — Heuristic judge (NO MODEL, instant):
+  - Compare extracted markdown vs ground_truth_text (GLM-OCR):
+    word_recall = (GLM-OCR words found in markdown) / (total GLM-OCR words)
+  - Compare vs ElementInventory:
+    element_coverage = (docling elements found in markdown) / (total docling elements)
+  - Hallucination rate = (markdown words NOT in GLM-OCR) / (total markdown words)
+  - gap_report: specific missing sections, wrong values, structural gaps
+  - score: 0.6 * word_recall + 0.3 * element_coverage + 0.1 * (1 - hallucination_rate)
+
+Phase 5 — Re-extract (conditional, qwen3-vl:8b reloaded):
+  - Only if score < 8.0
+  - Gap-informed prompt: "Previous extraction missed: [X, Y, Z]. Include these."
+  - Re-runs extraction on problem pages only
+  - UNLOAD after
+
+Phase 6 — VLM judge (optional, qwen3-vl:4b):
+  - Only for pages with genuine image-only content (no GLM-OCR text baseline)
+  - qwen3-vl:4b (3.3 GB, faster than 8b) for evaluation
+  - UNLOAD after
+
+Phase 7 — Deep review (optional, --review flag):
+  - qwen3:14b, grounded against GroundTruthMap
+  - UNLOAD after
+
+**DoclingPipelineOptions changes:**
+  - do_table_structure=True + TableStructureOptions(do_cell_matching=True) — enables TableFormer
+  - populate caption field from docling item for pictures and tables
+  - Surya reading order for poster pages (detect multi-column layout before extraction)
+
+**New library:**
+  - camelot-py[cv] for PDF grid tables (lattice algorithm, no neural network)
+  - All other improvements use existing installed libraries
+
+**Model roles:**
+  Ground-truth text:   glm-ocr (2.2 GB, always loaded during Phase 1)
+  VLM extraction:      qwen3-vl:8b (6.1 GB, Phase 3 only)
+  VLM judge (images):  qwen3-vl:4b (3.3 GB, Phase 6 only, rare)
+  Deep review:         qwen3:14b (9 GB, Phase 7, optional)
+  Text judge:          none — instant heuristic using GLM-OCR baseline
+
+**See:** D45 (GLM-OCR design) D47 (4-level judge this replaces) D49 (two-model split) D51 (poster_mode)
+
+---

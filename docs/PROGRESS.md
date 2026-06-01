@@ -1,6 +1,6 @@
 ---
 type: session-log
-updated: 2026-05-31 (Session 27)
+updated: 2026-06-01 (Session 28)
 ---
 
 # Progress — cloak
@@ -10,6 +10,13 @@ updated: 2026-05-31 (Session 27)
 > | [[CLAUDE.md]] · [[ARCHITECTURE.md]] · [[MODULES.md]] · [[MODELS.md]] · [[DECISIONS.md]]
 
 ---
+
+## Session 28 — end of 2026-06-01
+
+- **D52 designed and documented** — ground-truth-first pipeline using GLM-OCR as text baseline for all pages, heuristic judge (word recall + element coverage, no model), gap-informed re-extraction instead of patching, camelot for grid tables, docling TableFormer enabled. See [[docs/DECISIONS.md]] §D52.
+- **Folder cleanup** — deleted `data/samples/poster/` (10 PDFs, all exact duplicates of `data/samples/icmr_stw/`), deleted stray `data/Engineering thermodynamics P K Nag 4ed.pdf` (already in textbook/), deleted `data/samples/invoice/test_run_output.txt`. Added `data/batch_logs/` to `.gitignore`.
+- **Direction confirmed**: use existing libraries better — GLM-OCR on all pages (not just scanned), docling TableFormer (not just layout), camelot for grid tables. `unstructured` not needed — docling + GLM-OCR + surya cover the same ground with less overhead.
+- **Implementation queued for next session**: Phase 1 GroundTruthMap, heuristic judge, gap-informed re-extraction, poster_mode coverage threshold, camelot integration.
 
 ## Session 27 — end of 2026-05-31
 

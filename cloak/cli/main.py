@@ -112,6 +112,14 @@ def parse(
                 "elapsed": time.monotonic() - file_t0,
                 "status":  "fail",
             })
+            # Mark as ERROR in registry so it shows up correctly in `cloak list`
+            try:
+                from cloak import registry as _reg_module
+                _reg, _ws = _reg_module.load(Path.cwd())
+                _reg_module.upsert(_reg, pdf, _ws, status=_reg_module.ERROR)
+                _reg_module.save(_reg, _ws)
+            except Exception:
+                pass
 
     # Batch summary table (only for multi-file runs)
     if len(pdfs) > 1:
@@ -144,6 +152,15 @@ def status() -> None:
     from cloak.cli import system_check
     system_check.run_startup_cleanup()
     system_check.show_startup_screen()
+
+
+@app.command()
+def setup(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Pull missing models without prompting"),
+) -> None:
+    """Detect hardware and configure the best model stack for this machine."""
+    from cloak.cli.setup import run_setup
+    run_setup(auto_pull=yes)
 
 
 def _read_best_score(conf_path: Path) -> str:

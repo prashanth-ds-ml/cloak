@@ -6,62 +6,42 @@ General-purpose. Local-only. No data leaves the machine.
 
 ## Next session — start here
 
-**Sprint 1 · ICMR Standard Treatment Workflows · Session 27**
+**Sprint 1 · ICMR Standard Treatment Workflows · Session 30**
 
 **First task:** run `pytest tests/ -q` — confirm still 60/60.
 
-**Architecture for Session 28: Ground-truth-first pipeline (D52)**
+**Profiler is solid. Next focus: improve it further, then use it to drive extraction.**
 
-The direction is fully designed and documented. Implement in this order:
+**Implement in this order:**
 
-**1. Install camelot:**
-```powershell
-pip install camelot-py[cv]
-```
+**1. Fix OCR errors — medical correction pass:**
+Add `correct_medical_ocr(text)` function that calls qwen3:14b to fix phonetic/visual substitutions:
+- THROMBOVIC → THROMBOLYTIC, ISTERITY → TERTIARY, SURRAGENOID MEMORAGE → SUBARACHNOID HAEMORRHAGE
+- Prompt: "Fix OCR errors. Keep all clinical values (numbers, doses, thresholds) exact."
+- File: `scripts/profiler.py` → add after `_ocr_page_glm()` call
 
-**2. Enable docling TableFormer + captions in `doc_profiler.py`:**
-```python
-from docling.datamodel.pipeline_options import TableStructureOptions
-PdfPipelineOptions(
-    do_ocr=False,
-    do_table_structure=True,
-    table_structure_options=TableStructureOptions(do_cell_matching=True),
-    accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
-)
-```
-Also populate `caption` field in `_add_item()` from docling item.
+**2. Fix GLM-OCR hallucination detection:**
+cardiology_nstemi generated "CONSIDERATION 1–100" fake sections.
+Add to profiler: if >10 sections AND >50% match `CONSIDERATION \d+` → discard GLM-OCR, use pdfplumber picture bbox text.
 
-**3. Run GLM-OCR on ALL pages (not just scanned) in Phase 1 — `doc_profiler.py`:**
-- After docling pass, call `extract_glm_page(page_image)` for every page
-- Store as `ground_truth_text: dict[int, str]` in a new `GroundTruthMap` dataclass
-- This is the text baseline for the judge — no VLM needed
+**3. Fix cardiology_af 3-column detection:**
+Spanning header STROKE RISK SCORE at x=2.6% skews the column clustering.
+Fix: filter headers with x < 5% before clustering — these are spanning/left-margin headers.
 
-**4. Replace VLM judge with heuristic judge using GLM-OCR baseline — `quality_judge.py`:**
-```
-score = 0.6 * word_recall + 0.3 * element_coverage + 0.1 * (1 - hallucination_rate)
-word_recall      = len(glm_words ∩ md_words) / len(glm_words)
-element_coverage = found_elements / expected_elements (from docling)
-hallucination    = len(md_words - glm_words) / len(md_words)
-```
-Produces gap_report of specific missing content — actionable for re-extraction.
+**4. Build GroundTruthMap from DocumentProfile:**
+Create `cloak/profiling/ground_truth.py` with `build_ground_truth_map(pdf_path) -> GroundTruthMap` that the pipeline imports from `profiler.py`.
+Fields: strategy, column_boundaries, ordered_text (GLM-OCR corrected), sections, picture_bboxes, picture_texts.
 
-**5. Replace patch loop with gap-informed re-extraction:**
-- If score < 8.0: reload qwen3-vl:8b, re-run extraction on low-scoring pages WITH gap_report in prompt
-- "Previous extraction missed these sections: [X, Y, Z]. Make sure to include them."
-- No tool-calling, no patching — just a better extraction pass
+**5. Wire DocumentProfile into parser_agent.py Phase 1:**
+Replace current Phase 1b (basic GLM-OCR pass) with full `build_ground_truth_map()`.
+This gives Phase 3 all the routing information it needs.
 
-**6. Fix poster_mode detection for AF:**
-Change `_detect_poster()` to use coverage ratio instead of element count:
-`docling_text_coverage = sum(len(e.text) for text_elements) / len(pg.text)`
-Fire poster_mode when coverage < 0.50. AF: 33.9% fires ✓. Stroke: 84.7% doesn't ✓.
-
-**7. Run 5 ICMR STWs to validate:** dengue, cardiology_af, neurology_stroke, cardiology_stemi, neonatology_sepsis
-
-**Key work committed this session (Session 28):**
-- D52 documented in DECISIONS.md
-- data/samples/poster/ cleaned (duplicates removed)
-- data/batch_logs/ added to .gitignore
-- Session 27 code changes committed (judge prompts, hallucination filter, POSTER_PROMPT)
+**Key profiling findings (Session 29) — read `docs/PROFILER_FINDINGS.md`:**
+- GLM-OCR outputs HTML tables (not plain text) — parse with `glm_to_plain_text()`
+- 23 OCR error types catalogued across 19 docs
+- 5 edge cases: hallucination, corrupt PDF, GGML errors, minimal output, partial extraction
+- Column detection: 16/19 correct. neurology_epilepsy: 3 columns correctly detected ✓
+- Picture sections: pdfplumber can extract content from inside picture bboxes
 
 **Tests baseline:** 60/60 passing. Run `pytest tests/ -q` before writing any code.
 

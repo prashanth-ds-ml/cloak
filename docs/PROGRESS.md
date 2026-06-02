@@ -1,6 +1,6 @@
 ---
 type: session-log
-updated: 2026-06-01 (Session 28)
+updated: 2026-06-02 (Session 29)
 ---
 
 # Progress — cloak
@@ -10,6 +10,19 @@ updated: 2026-06-01 (Session 28)
 > | [[CLAUDE.md]] · [[ARCHITECTURE.md]] · [[MODULES.md]] · [[MODELS.md]] · [[DECISIONS.md]]
 
 ---
+
+## Session 29 — end of 2026-06-02
+
+- **Profiler built** (`scripts/profiler.py`) — combines pdfplumber + docling + GLM-OCR into a `DocumentProfile` dataclass. Outputs per-doc `.txt` and `.json` reports. All 19 ICMR STWs profiled.
+- **GLM-OCR image resize fixed** — GGML tensor errors on full-res ICMR A3 pages (1754×3404px). Added RGB conversion + retry loop (1024→768→512px long-edge). 16/19 docs now succeed.
+- **GLM-OCR returns HTML tables** — not plain text. Added `glm_to_plain_text()` HTML parser. GLM-OCR now correctly identifies 5–19 clinical sections per document.
+- **Column detection working** — from docling section header X clustering. 16/19 correct. neurology_epilepsy: 3 columns correctly detected at 49.2% and 70.7%.
+- **Picture section content analysis** — for each large docling `picture` element, extract pdfplumber text within that bbox. Confirmed: content IS in pdfplumber, just spatially confused.
+- **23 OCR error types catalogued** — phonetic/visual substitutions (THROMBOVIC, ISTERITY, SURRAGENOID MEMORAGE, etc.). Fix: qwen3:14b medical correction pass.
+- **5 edge cases identified** — hallucination (nstemi), corrupt PDF (neuroinfections), GGML errors (epilepsy/ortho/tb), minimal output (stroke), partial extraction (af).
+- **GLM-OCR hallucination** — nstemi generated "CONSIDERATION 1–100" fake sections. Detection rule: >10 sections + >50% match `CONSIDERATION \d+` → discard.
+- **Full findings documented** in `docs/PROFILER_FINDINGS.md`.
+- **Tests: 60/60.**
 
 ## Session 28 — end of 2026-06-01
 

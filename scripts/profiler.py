@@ -585,16 +585,22 @@ def write_report(prof: DocumentProfile) -> str:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/samples/icmr_stw")
+    args = sys.argv[1:]
+    # --correct flag enables qwen3:14b OCR correction (slow, off by default for batch)
+    use_correction = "--correct" in args
+    args = [a for a in args if not a.startswith("--")]
+
+    target = Path(args[0]) if args else Path("data/samples/icmr_stw")
     pdfs = sorted(target.rglob("*.pdf")) if target.is_dir() else [target]
 
-    print(f"Profiling {len(pdfs)} PDF(s)  ->  {LOG_DIR}/\n")
+    mode = "with OCR correction" if use_correction else "fast mode (no OCR correction)"
+    print(f"Profiling {len(pdfs)} PDF(s)  [{mode}]  ->  {LOG_DIR}/\n")
 
     summary = []
     for pdf_path in pdfs:
         print(f"  [{pdf_path.stem}] ...", end=" ", flush=True)
         t0 = time.monotonic()
-        prof = profile(pdf_path)
+        prof = profile(pdf_path, use_ocr_correction=use_correction)
         elapsed = round(time.monotonic() - t0, 1)
         hallucinated = "HALLUC " if getattr(prof, "_glm_hallucination", False) else ""
         multipage = f" {prof.page_count}pp" if prof.page_count > 1 else ""
@@ -617,6 +623,7 @@ def main():
             "name": prof.name,
             "coverage": prof.docling_coverage_pct,
             "columns": prof.columns.count,
+            "glm_hallucination": getattr(prof, "_glm_hallucination", False),
             "col_boundaries": prof.columns.boundaries_pct,
             "glm_chars": prof.glm_chars,
             "picture_sections": len(prof.picture_sections),

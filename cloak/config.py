@@ -80,7 +80,7 @@ OCR_LANG                = "eng"       # Tesseract language code (D22)
 OCR_PRIMARY             = "glm-ocr"   # D45 — GLM-OCR: #1 OmniDocBench, document-specialised
 OCR_FALLBACK            = "surya"     # D30 — surya fallback when GLM-OCR unavailable
 OCR_LAST_RESORT         = "tesseract" # D22 — last resort
-GLM_OCR_TIMEOUT         = 60          # seconds per page (GLM-OCR is fast at 2.2 GB)
+GLM_OCR_TIMEOUT         = 120         # seconds per page — complex ICMR pages need up to 75s per attempt
 
 # ── Math OCR (D35 / D40) ───────────────────────────────────────────────────────
 MATH_OCR_ENGINE         = "pix2tex"   # local pix2tex only; set "auto" in .cloak_local.json to enable Mathpix

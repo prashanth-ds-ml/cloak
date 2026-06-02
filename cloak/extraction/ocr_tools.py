@@ -178,46 +178,77 @@ Extract all content from this document page into clean markdown.
 - Output only the extracted markdown content, no preamble or commentary."""
 
 
+_GLM_SIZES = [1024, 768, 512]   # long-edge caps to try — some images trigger GGML
+                                # tensor assertion errors at certain dimensions;
+                                # retry with smaller sizes as fallback
+
+
+def _resize_for_glm(image: Image.Image, max_px: int) -> Image.Image:
+    w, h = image.size
+    long_edge = max(w, h)
+    if long_edge <= max_px:
+        return image
+    scale = max_px / long_edge
+    return image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+
 def _ocr_page_glm(image: Image.Image) -> str:
     """
     Run GLM-OCR (Ollama) on a page image. #1 on OmniDocBench V1.5 (D45).
     Handles text, tables, formulas, and complex layouts in one pass.
     Raises OCRError on failure — caller falls back to surya.
+    Retries with progressively smaller sizes — some images trigger GGML tensor
+    assertion errors (status 500) at specific dimensions. ICMR A3 pages at full
+    resolution (1754×3404px) always fail; 1024px long-edge (527×1024) works for most.
     """
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    img_bytes = buf.getvalue()
+    # Strip alpha channel — RGBA images trigger GGML tensor shape errors in GLM-OCR
+    if image.mode != "RGB":
+        image = image.convert("RGB")
 
-    result_q: queue.Queue = queue.Queue()
+    last_error = None
+    for max_px in _GLM_SIZES:
+        resized = _resize_for_glm(image, max_px)
+        buf = io.BytesIO()
+        resized.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
 
-    def _worker() -> None:
+        result_q: queue.Queue = queue.Queue()
+
+        def _worker(img_b=img_bytes) -> None:
+            try:
+                resp = ollama.chat(
+                    model=GLM_OCR_MODEL,
+                    messages=[{
+                        "role":    "user",
+                        "content": _GLM_OCR_PROMPT,
+                        "images":  [img_b],
+                    }],
+                    options={"num_ctx": 4096},
+                    keep_alive=MODEL_KEEP_ALIVE,
+                )
+                result_q.put(("ok", resp.message.content.strip()))
+            except Exception as exc:
+                result_q.put(("err", exc))
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
         try:
-            resp = ollama.chat(
-                model=GLM_OCR_MODEL,
-                messages=[{
-                    "role":    "user",
-                    "content": _GLM_OCR_PROMPT,
-                    "images":  [img_bytes],
-                }],
-                options={"num_ctx": 4096},
-                keep_alive=MODEL_KEEP_ALIVE,
-            )
-            result_q.put(("ok", resp.message.content.strip()))
-        except Exception as exc:
-            result_q.put(("err", exc))
+            kind, value = result_q.get(timeout=GLM_OCR_TIMEOUT)
+        except queue.Empty:
+            raise OCRError(f"GLM-OCR timed out after {GLM_OCR_TIMEOUT}s")
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    try:
-        kind, value = result_q.get(timeout=GLM_OCR_TIMEOUT)
-    except queue.Empty:
-        raise OCRError(f"GLM-OCR timed out after {GLM_OCR_TIMEOUT}s")
+        if kind == "err":
+            err_str = str(value)
+            if "GGML_ASSERT" in err_str or "status code: 500" in err_str:
+                last_error = OCRError(f"GLM-OCR failed: {value}")
+                continue   # retry with smaller image
+            raise OCRError(f"GLM-OCR failed: {value}")
 
-    if kind == "err":
-        raise OCRError(f"GLM-OCR failed: {value}")
-    if not value:
-        raise OCRError("GLM-OCR returned empty response")
-    return value
+        if not value:
+            raise OCRError("GLM-OCR returned empty response")
+        return value
+
+    raise last_error or OCRError("GLM-OCR failed at all resize levels")
 
 
 def is_glm_ocr_available() -> bool:

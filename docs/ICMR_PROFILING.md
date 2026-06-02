@@ -1,295 +1,240 @@
-# ICMR STW Profiling Findings
+# ICMR STW Profiling Findings — All 19 Documents
 
-> Deep profiling of 7 ICMR Standard Treatment Workflow PDFs.
-> Run date: Session 29 · Script: `scripts/profile_icmr.py`
-> Goal: understand the exact structure of each document before writing extraction code.
-
----
-
-## Universal facts about ICMR STWs
-
-All 7 profiled documents share these characteristics:
-
-| Property | Value | Notes |
-|---|---|---|
-| Page size | 842 × 1634 pts | 11.7" × 22.7" — A3 portrait format |
-| Page count | 1 | Always single page |
-| No bitmap images | 0% image area ratio (mostly) | Boxes and flowcharts are PDF vector, not bitmaps |
-| PDF vector content | Yes | Text and boxes are real PDF text, not scanned |
-
-**All ICMR STWs are single-page A3 PDF vector documents.** The boxes and arrows are PDF drawing commands, not images. pdfplumber can extract the text but in wrong order. Docling can extract structure but misses content inside complex sections (treats them as `picture` elements).
+> Deep profiling combining pdfplumber + docling + GLM-OCR on all 19 ICMR STWs.
+> Run: Session 29 · Script: `scripts/profile_combined.py`
+> Purpose: understand each document before writing extraction code.
 
 ---
 
-## Per-document profiles
+## Universal facts across all 19 ICMR STWs
 
-### paediatrics_dengue.pdf
-
-```
-pdfplumber:  4,290 chars · 649 words · 6 tables · 0 images
-Docling:     2.9% coverage (123/4290 chars) · 6 elements total
-             3 picture · 1 section_header · 2 text
-Columns:     1 (single column, or all in one big picture)
-Large pictures: 1 — x=0% y=12% size=99%w × 84%h  ← ENTIRE CONTENT
-```
-
-**Diagnosis:** The whole flowchart (84% of page height) is ONE large `picture` element in docling. Docling sees almost nothing — 2.9% coverage. pdfplumber has the text but in wrong spatial order. This is the extreme case requiring full VLM poster extraction.
-
-**pdfplumber tables:** 6 tables found, including:
-- Full flowchart layout (y=0-50%)
-- COMPENSATED SHOCK section (y=54-57%)
-- HYPOTENSIVE SHOCK section (y=54-57%)
-- Discharge criteria (y=90-100%)
-
-**Extraction approach:** poster_mode → VLM full page (qwen2.5vl:7b) or GLM-OCR text + structure pass
-
----
-
-### cardiology_af.pdf
-
-```
-pdfplumber:  5,849 chars · 851 words · 3 tables · 1 image (3.6%)
-Docling:     34.4% coverage (2014/5849 chars) · 69 elements
-             5 picture · 16 section_header · 39 list_item · 8 text · 1 table
-Columns:     3  (x < ~35% | 35-63% | 63-100%)
-Large pictures: 2 — Heart Rate Control (y=44%, 100%w × 30%h) + Management Algorithm (y=75%, 96%w × 17%h)
-```
-
-**Diagnosis:** Three-column layout. Top 42% of page (risk assessment, scoring) is well-structured text in docling. Bottom 58% (heart rate control + management algorithm) is treated as `picture` by docling — those sections are complex multi-column tables with embedded text. 34.4% docling coverage means we're missing 3,835 chars of clinical content.
-
-**3 columns confirmed from section header X positions:**
-- Column 1 (x=0-35%): SYMPTOMS, SIGNS, LOOK FOR RISK FACTORS
-- Column 2 (x=35-63%): LOOK FOR PRECIPITATING FACTORS, MANAGEMENT PRINCIPLES, HEART RATE CONTROL
-- Column 3 (x=63-100%): CATEGORIZE AF, LOOK FOR IMMEDIATE INTERVENTION INDICATORS, CHOICE OF ANTI-COAGULATION
-
-**pdfplumber tables:**
-- Table 1 (y=31-42%): CHA2DS2-VASc / HAS-BLED — 3 rows × 4 cols — grid table suitable for camelot
-- Table 2 (y=43-75%): HEART RATE CONTROL — 13 rows × 7 cols — complex management algorithm
-- Table 3 (y=96-100%): Footer
-
-**Extraction approach:** Column-aware docling sort (top 42%) + camelot for CHA2DS2-VASc table + VLM crop for heart rate section
-
----
-
-### neurology_stroke.pdf
-
-```
-pdfplumber:  5,313 chars · 805 words · 1 table · 0 images
-Docling:     84.5% coverage (4489/5313 chars) · 43 elements
-             5 picture · 11 section_header · 18 list_item · 9 text
-Columns:     mixed (some multi-column sections)
-Large pictures: 0 (no large content pictures)
-```
-
-**Diagnosis:** Best docling coverage of all (84.5%). Most content is captured. The missing 15.5% (824 chars) is likely in the one complex table (TYPES OF STROKE, y=34-55%, 5 rows × 8 cols). No large picture areas — this is the most "text-like" of all ICMR STWs.
-
-**Section headers found:** Only 10 headers (missing: PRELIMINARY MANAGEMENT, INVESTIGATIONS, etc.) — these sections are inside the large table at y=34-55%.
-
-**pdfplumber tables:**
-- Table 1 (y=34-55%): TYPES OF STROKE — 5 rows × 8 cols — complex clinical table with ISCHEMIC / HAEMORRHAGIC / MANAGEMENT sections
-
-**Extraction approach:** Docling path + column sort + pdfplumber table for TYPES OF STROKE section
-
----
-
-### cardiology_stemi.pdf
-
-```
-pdfplumber:  6,625 chars · 1,011 words · 6 tables · 0 images
-Docling:     29.1% coverage (1927/6625 chars) · 44 elements
-             5 picture · 14 section_header · 20 list_item · 5 text
-Columns:     2  (boundary at x=22%)
-Large pictures: 2 — diagnosis section (y=9%, 99%w × 20%h) + drugs/dosage section (y=52%, 100%w × 39%h)
-```
-
-**Diagnosis:** Two-column layout detected correctly (boundary at 22%). Top section (y=0-29%) and bottom sections (y=52-95%) are large pictures. The clinical pathway content (PCI capable hospital, GENERAL MEASURES, thrombolysis) is well-captured in docling (column sort output looked correct). The DRUGS & DOSAGE table (y=52-92%, 5 rows × 12 cols) is the main missing piece.
-
-**Column-sorted reading order worked correctly for stemi** — the docling extracted content came out in the right clinical order (PCI CAPABLE / PCI INCAPABLE side by side at y=38-50% correctly separated).
-
-**pdfplumber tables:**
-- Table 4 (y=38-51%): PCI INCAPABLE CENTRE — 2 rows × 1 col
-- Table 5 (y=51-56%): PATIENT WITH STEMI IN 12-24 HOURS — 3 rows × 2 cols
-- Table 6 (y=61-92%): DRUGS & DOSAGE / CONTRA-INDICATIONS — 5 rows × 12 cols ← most important missing section
-
-**Extraction approach:** Column-aware docling sort (works for top 52%) + camelot for DRUGS & DOSAGE table (complex 12-col table)
-
----
-
-### neonatology_sepsis.pdf
-
-```
-pdfplumber:  5,356 chars · 826 words · 5 tables · 0 images
-Docling:     65.5% coverage (3508/5356 chars) · 54 elements
-             6 picture · 10 section_header · 17 list_item · 19 text · 2 table
-Columns:     1 (single column or 2-column with boundary around x=50%)
-Large pictures: 1 — clinical assessment section (y=15%, 97%w × 25%h)
-```
-
-**Diagnosis:** Good docling coverage (65.5%). One large picture section (y=15-40%, 25% of page height) contains the clinical assessment content. The rest of the document (AT-RISK SEPSIS, REVIEW AT 48 HRS, DURATION OF ANTIBIOTICS, REMEMBER, ABBREVIATIONS) is well-captured.
-
-**Section headers:** HIGH PROBABILITY OF SEPSIS and AT-RISK/SUSPECT SEPSIS both at y=41.6% but different X (15% vs 67%) — 2-column layout for those sections.
-
-**Extraction approach:** Docling path + VLM crop for the large picture section (y=15-40%)
-
----
-
-### psychiatry_depression.pdf
-
-```
-pdfplumber:  6,608 chars · 1,038 words · 2 tables · 4 images (9.3%)
-Docling:     84.2% coverage (5563/6608 chars) · 59 elements
-             5 picture · 10 section_header · 33 list_item · 10 text · 1 table
-Columns:     2  (boundary at x=22%)
-Large pictures: 1 — left column section (y=14%, 29%w × 21%h)
-```
-
-**Diagnosis:** Second-best docling coverage (84.2%). Two-column layout (same 22% boundary as stemi). The column-sorted reading order produced a nearly perfect extraction. Missing content (1,045 chars) is inside the large picture in the left column (y=14-35%).
-
-**pdfplumber tables:**
-- Table 1 (y=29-35%): Severity classification — 4 rows × 3 cols (mild/moderate/severe symptoms)
-- Table 2 (y=39-100%): AT PRIMARY CARE / SECONDARY CARE treatment — 12 rows × 4 cols ← main treatment table
-
-**Extraction approach:** Docling path with column sort (works well) + camelot for treatment table
-
----
-
-### ortho_low_back_pain.pdf
-
-```
-pdfplumber:  5,804 chars · 870 words · 5 tables · 122 images (24.5%)
-Docling:     [profiling failed — Unicode encoding error in terminal output]
-```
-
-**Diagnosis (from partial data):** 122 images with 24.5% area coverage — this is the most image-heavy ICMR STW. The images are likely small icons, checkboxes, or decorative elements. Needs re-profiling with UTF-8 encoding.
-
----
-
-## Cross-document patterns
-
-### 1. Docling coverage as extraction strategy signal
-
-| Coverage | Documents | Extraction approach |
-|---|---|---|
-| < 30% | dengue (2.9%), stemi (29.1%) | poster_mode: VLM full-page extraction |
-| 30–70% | cardiology_af (34.4%), neonatology_sepsis (65.5%) | Hybrid: docling text + VLM/camelot for picture sections |
-| > 70% | stroke (84.5%), depression (84.2%) | Docling path: column sort → good output |
-
-**This replaces the current `_detect_poster()` threshold.** Instead of counting docling elements, use coverage percentage:
-- Coverage < 40%: poster_mode (full VLM)
-- Coverage 40-75%: hybrid mode (docling + targeted extraction for picture sections)
-- Coverage > 75%: text_mode (docling path + column sort)
-
-### 2. Column layout patterns
-
-| Doc | Columns | Column boundaries | Detection |
-|---|---|---|---|
-| dengue | 1 (all in picture) | n/a | n/a |
-| cardiology_af | 3 | ~35%, ~63% | FAILED (algorithm needs fix) |
-| stroke | 1-2 (unclear) | ~32% possibly | FAILED |
-| stemi | 2 | 22% | CORRECT |
-| sepsis | 1-2 | ~50% possibly | Not detected |
-| depression | 2 | 22% | CORRECT |
-
-**Stemi and depression both have boundary at x=22%** — a narrow left reference/note column and a main content column. This might be a common ICMR template pattern.
-
-**Cardiology AF has 3 columns** — the algorithm failed because filtering at x < 60% excluded the right-column headers. Algorithm needs to consider all headers including those at x > 60%.
-
-### 3. The "large picture" problem
-
-Every ICMR STW has 1-2 large `picture` elements in docling that contain clinical content:
-
-| What docling calls a picture | What it actually is |
+| Property | Value |
 |---|---|
-| dengue (y=12%, 99%×84%) | The entire clinical flowchart |
-| AF (y=44%, 100%×30%) | HEART RATE CONTROL flowchart table |
-| AF (y=75%, 96%×17%) | MANAGEMENT ALGORITHM flowchart |
-| stemi (y=9%, 99%×20%) | ANGINA/CHEST PAIN diagnosis section |
-| stemi (y=52%, 100%×39%) | DRUGS & DOSAGE table |
-| sepsis (y=15%, 97%×25%) | Clinical assessment |
-| depression (y=14%, 29%×21%) | Left-column WHEN TO SUSPECT section |
+| Page count | 1 (always single page) |
+| Page size | 842 × 1634 pts (11.7" × 22.7" — A3 portrait) |
+| PDF type | Born-digital vector PDF (not scanned) |
+| Image area | 0–10% (flowchart boxes are vector art, not bitmap images) |
 
-**These are NOT images.** They are PDF sections where the content is rendered with complex visual formatting (colored backgrounds, merged cells, arrows). pdfplumber can read the text from them — the bbox information tells us exactly where they are.
+---
 
-### 4. pdfplumber tables as a signal
+## Complete profiling table (all 19 documents)
 
-| Doc | pdfplumber tables | Significance |
+| Document | PDF chars | PDF tables | Docling elems | Docling coverage | Large pics | GLM-OCR chars | Recommended strategy |
+|---|---|---|---|---|---|---|---|
+| cardiology_af | 5,849 | 3 | 69 | **34.4%** | 2 | 919* | hybrid |
+| cardiology_bradyarrhythmia | 4,884 | 1 | 109 | 81.9% | 0 | 3,743 | text_mode |
+| cardiology_heart_failure | 6,988 | 1 | 178 | 93.0% | 1 | 3,870 | text_mode |
+| cardiology_nstemi | 7,934 | 4 | 146 | 58.5% | 1 | 4,835 | hybrid |
+| cardiology_stable_angina | 6,004 | 2 | 140 | 93.4% | 0 | 5,013 | text_mode |
+| cardiology_stemi | 6,625 | 6 | 44 | **29.1%** | 2 | 5,186 | poster_mode |
+| ctvs_head_injury | 7,133 | 3 | 136 | 78.0% | 1 | 4,008 | text_mode |
+| neonatology_sepsis | 5,356 | 5 | 54 | 65.5% | 1 | 5,452 | text_mode |
+| neurology_acute_paralysis | 4,179 | 1 | 7 | **5.0%** | 1 | 4,468 | poster_mode |
+| neurology_dementia | 4,966 | 3 | 34 | 66.7% | 2 | 3,702 | text_mode |
+| neurology_epilepsy | 7,314 | 5 | 47 | 71.5% | 0 | 0** | text_mode |
+| neurology_headache | 5,295 | 3 | 14 | **7.9%** | 1 | 3,645 | poster_mode |
+| neurology_neuroinfections | 5,103 | 12 | 0† | 0% | 0 | 4,223 | poster_mode |
+| neurology_stroke | 5,313 | 1 | 43 | 84.5% | 0 | 1,981 | text_mode |
+| oncology_breast | 5,821 | 7 | 89 | 61.1% | 3 | 3,441 | text_mode |
+| ortho_low_back_pain | 5,804 | 5 | 27 | 38.9% | 1 | 0** | hybrid |
+| paediatrics_dengue | 4,290 | 6 | 6 | **2.9%** | 1 | 3,390 | poster_mode |
+| psychiatry_depression | 6,608 | 2 | 59 | 84.2% | 1 | 5,781 | text_mode |
+| tb_adult_abdominal | 5,499 | 4 | 11 | **12.4%** | 1 | 0** | poster_mode |
+
+`*` cardiology_af: GLM-OCR extracted only 919 chars (partial — large image hits 1024px limit at 527px wide)
+`**` GLM-OCR failed at all resize levels (1024/768/512px) — content-specific GGML bug in model
+`†` neurology_neuroinfections: corrupt PDF — docling fails, but GLM-OCR works from rendered image
+
+---
+
+## Document groups by extraction strategy
+
+### Group A — text_mode (docling coverage > 60%) — 10 documents
+
+GLM-OCR ordered text + docling heading structure. No VLM needed.
+
+```
+cardiology_bradyarrhythmia  81.9%   3,743 glm chars
+cardiology_heart_failure    93.0%   3,870 glm chars
+cardiology_stable_angina    93.4%   5,013 glm chars
+ctvs_head_injury            78.0%   4,008 glm chars
+neonatology_sepsis          65.5%   5,452 glm chars
+neurology_dementia          66.7%   3,702 glm chars
+neurology_epilepsy          71.5%   0 glm (fallback: pdfplumber)
+neurology_stroke            84.5%   1,981 glm chars
+oncology_breast             61.1%   3,441 glm chars
+psychiatry_depression       84.2%   5,781 glm chars
+```
+
+For these: GLM-OCR gives correctly-ordered text, docling gives heading hierarchy.
+Combine → structured markdown without any VLM call.
+
+### Group B — hybrid (30–60% coverage) — 3 documents
+
+GLM-OCR text for well-structured sections + targeted VLM crop or camelot for large picture sections.
+
+```
+cardiology_af     34.4%   2 large pictures (y=44%, y=75%)   919 glm (partial)
+cardiology_nstemi 58.5%   1 large picture  (y=10%)          4,835 glm chars
+ortho_low_back_pain 38.9% 1 large picture                   0 glm (pdfplumber)
+```
+
+### Group C — poster_mode (< 30% coverage) — 6 documents
+
+Most content is in large picture elements. Full-page VLM extraction needed.
+GLM-OCR text is good fallback when VLM fails.
+
+```
+cardiology_stemi         29.1%   2 large pictures   5,186 glm chars
+neurology_acute_paralysis  5.0%  1 large picture    4,468 glm chars
+neurology_headache         7.9%  1 large picture    3,645 glm chars
+neurology_neuroinfections  0%    corrupt PDF        4,223 glm chars ← GLM-OCR still works!
+paediatrics_dengue         2.9%  1 large picture    3,390 glm chars
+tb_adult_abdominal        12.4%  1 large picture    0 glm (GGML error)
+```
+
+---
+
+## Key insight: GLM-OCR vs pdfplumber vs docling
+
+### GLM-OCR chars vs pdfplumber chars
+
+For docs where GLM-OCR worked:
+
+| Doc | PDF chars | GLM chars | Ratio | Notes |
+|---|---|---|---|---|
+| psychiatry_depression | 6,608 | 5,781 | 87.5% | Good coverage |
+| cardiology_stable_angina | 6,004 | 5,013 | 83.5% | Good coverage |
+| neonatology_sepsis | 5,356 | 5,452 | 101.8% | GLM > PDF (adds table formatting) |
+| cardiology_stemi | 6,625 | 5,186 | 78.3% | Good coverage |
+| neurology_acute_paralysis | 4,179 | 4,468 | 106.9% | GLM > PDF |
+| cardiology_nstemi | 7,934 | 4,835 | 61.0% | Partial (complex tables) |
+| neurology_stroke | 5,313 | 1,981 | 37.3% | Low — likely timeout or partial |
+
+**GLM-OCR extracts 70-100%+ of pdfplumber chars in most cases**, with correct column-aware reading order.
+
+### The "large picture" content gap
+
+Every ICMR STW has 0–3 `picture` elements in docling that are actually clinical content (not logos). These are the sections where docling gave up. Identified by size > 5% of page area:
+
+| Doc | Large picture locations (y%) | What they contain |
 |---|---|---|
-| dengue | 6 | All major flowchart sections detected as tables |
-| cardiology_af | 3 | CHA2DS2-VASc (extractable), Heart Rate Control (complex) |
-| stroke | 1 | TYPES OF STROKE (8-col complex table) |
-| stemi | 6 | Multiple sections including DRUGS & DOSAGE |
-| sepsis | 5 | Multiple assessment tables |
-| depression | 2 | Severity table + treatment table |
-
-**pdfplumber table bboxes tell us exactly where complex content is.** We can use these bboxes to route specific regions to camelot or VLM crops, not the whole page.
-
----
-
-## Recommended extraction architecture per document
-
-```
-dengue:
-  Approach: poster_mode (VLM full-page)
-  Fallback: GLM-OCR text + qwen3:14b structuring
-  Reason:   2.9% docling coverage — docling has nothing useful
-
-cardiology_af:
-  Approach: docling top sections + column sort
-            + camelot for CHA2DS2-VASc table (y=31-42%, clear grid)
-            + VLM crop for heart rate control (y=43-75%)
-            + VLM crop for management algorithm (y=75-93%)
-  Reason:   34.4% docling coverage, 3 columns, 2 large picture sections
-
-neurology_stroke:
-  Approach: docling path + column sort
-            + pdfplumber table for TYPES OF STROKE (y=34-55%)
-  Reason:   84.5% coverage, mostly text, one complex table
-
-cardiology_stemi:
-  Approach: docling path + column sort (2 cols, 22% boundary)
-            + camelot for DRUGS & DOSAGE table (y=61-92%, 12 cols)
-  Reason:   29.1% coverage BUT column sort works for PCI sections
-
-neonatology_sepsis:
-  Approach: docling path + VLM crop for clinical assessment section (y=15-40%)
-  Reason:   65.5% coverage, one large picture section
-
-psychiatry_depression:
-  Approach: docling path + column sort (2 cols, 22% boundary)
-            + camelot for treatment table (y=39-100%, 4 cols)
-  Reason:   84.2% coverage, column sort works very well
-
-ortho_low_back_pain:
-  Approach: Re-profile needed (Unicode error during profiling)
-  Note:     122 images suggest icon-heavy layout
-```
+| dengue | y=12% (84%h) | ENTIRE clinical flowchart |
+| stemi | y=9% (20%h), y=52% (39%h) | Diagnosis section + DRUGS table |
+| af | y=44% (30%h), y=75% (17%h) | Heart rate control + Mgmt algorithm |
+| acute_paralysis | y=? (large) | Most clinical content |
+| headache | y=? (large) | Most clinical content |
+| nstemi | y=10% (20%h) | Chest pain diagnosis section |
+| sepsis | y=15% (25%h) | Clinical assessment section |
+| depression | y=14% (21%h) | Left-column WHEN TO SUSPECT |
+| ctvs_head_injury | y=? (large) | Clinical content section |
+| dementia | 2 large sections | Clinical content |
+| oncology_breast | 3 large sections | Highest picture density |
 
 ---
 
-## What to build next (priority order)
+## GLM-OCR failure analysis
 
-### Immediate — fixes all docs
+### 3 documents that GGML-fail at all resize levels
 
-1. **Fix column detection** — include headers at x > 60% in boundary detection
-2. **Add `promote_allcaps_headings()` to postprocess.py** — fixes 0 headings on GLM-OCR fallback
-3. **Switch VISION_PRIMARY to qwen2.5vl:7b** — already installed, better document extraction
+`neurology_epilepsy`, `ortho_low_back_pain`, `tb_adult_abdominal`
 
-### Next session — targeted per-doc improvements
+**Cause:** Content-specific GGML tensor assertion error in the GLM-OCR model (`GGML_ASSERT(a->ne[2] * 4 == b->ne[0]) failed`). Tried all three sizes (1024px → 768px → 512px), converted to RGB — still fails. This is a bug in the Ollama/GLM-OCR model for specific image content.
 
-4. **Use docling coverage (not element count) for poster_mode detection**
-   - Coverage < 40%: poster_mode
-   - Coverage 40-75%: hybrid (docling + picture section extraction)
-   - Coverage > 75%: text_mode (docling + column sort)
+**Mitigation:** Fall back to pdfplumber text. These documents have pdfplumber coverage of 4,179–7,314 chars which is enough for text_mode extraction. The reading order will be imperfect (pdfplumber extracts in stream order) but content is present.
 
-5. **Extract picture sections by bbox** — when docling marks a region as `picture` but it spans > 10% of page height, extract it as a targeted region:
-   - Try camelot (if pdfplumber finds a table at that bbox)
-   - Fall back to VLM crop of that region
-   - Fall back to pdfplumber text from that region
+### cardiology_af partial extraction (919 chars)
 
-6. **Fix column-aware reading order** — reorder docling elements by detected columns before extraction
+At 527×1024px (the stable resize), the 3-column layout is only 176px wide per column — too narrow for accurate OCR. GLM-OCR extracts only the most prominent text. The retry sizes (768, 512) would be even narrower.
 
-### Future
+**Mitigation:** Use pdfplumber text for AF or extract at higher resolution (1536px long-edge, accept occasional GGML errors).
 
-7. **camelot for grid tables** — CHA2DS2-VASc (AF), DRUGS & DOSAGE (stemi), treatment table (depression)
-8. **Complete ortho_low_back_pain profiling** with UTF-8 encoding
-9. **Profile remaining 12 ICMR STWs** to build complete picture
+---
+
+## Section header extraction by GLM-OCR
+
+GLM-OCR sections were detected using ALL-CAPS line detection. Sample from key docs:
+
+### paediatrics_dengue (GLM-OCR, 3,390 chars)
+`WHEN TO SUSPECT?` `WARNING SIGNS` `ASSESSMENT` `TREATMENT OF PROBABLE DENGUE WITHOUT WARNING SIGNS` `SEVERE DENGUE` `REASONS FOR REFERRAL` `INVESTIGATIONS` `SHOCK` `COMPENSATED SHOCK` `HYPOTENSIVE SHOCK` `INDICATION FOR PLATELET TRANSFUSION & PACKED RED CELLS` `DISCHARGE CRITERIA`
+
+12 clinical sections correctly identified — matches the PDF structure exactly.
+
+### psychiatry_depression (GLM-OCR, 5,781 chars)
+`DEPRESSION ICD10-F45` `CORE SYMPTOMS` `CLINICAL ASSESSMENT` `ADDITIONAL SYMPTOMS` `ASSESSMENT OF SUICIDE RISK` `INVESTIGATION` `AT PRIMARY CARE` `REFERRAL TO SECONDARY CARE` `REFERENCES`
+
+9 sections — complete clinical structure captured.
+
+---
+
+## neurology_neuroinfections — special case
+
+Docling FAILS on this PDF (corrupt PDF format — pypdfium2 cannot open it).
+GLM-OCR WORKS (4,223 chars) — because GLM-OCR works from the rendered page image, not the PDF structure.
+
+**Insight:** Image-based extraction (GLM-OCR) is more robust than PDF-structure extraction (docling) for certain PDFs. Always run GLM-OCR from the rendered image, not from the PDF directly.
+
+---
+
+## Recommended profiler architecture
+
+Based on all 19 profiles:
+
+### Phase 1 profiling — always run in this order:
+
+```
+Step 1: pdfplumber  (instant)
+  → page geometry, word positions, table bboxes
+
+Step 2: docling  (8-12s, CPU)
+  → element types, heading hierarchy, bboxes
+  → identify "large picture" sections (content gaps)
+  → compute docling_coverage = docling_chars / pdfplumber_chars
+
+Step 3: GLM-OCR  (10-80s, GPU)
+  → column-aware text extraction (correct reading order)
+  → tables as markdown
+  → fallback chain: 1024px → 768px → 512px on GGML errors
+  → if all fail: use pdfplumber text as ground truth
+
+Step 4: Classify document
+  → coverage < 30%: poster_mode (VLM full-page)
+  → coverage 30-60%: hybrid (GLM-OCR + VLM crops for picture sections)
+  → coverage > 60%: text_mode (GLM-OCR ordered text + docling headings)
+```
+
+### Phase 3 extraction — strategy per group:
+
+**text_mode (10 docs, 53% of corpus):**
+- Primary content: GLM-OCR ordered text (correct column order)
+- Structure: docling section headers (inject ## headings at correct positions)
+- Tables: pdfplumber table bboxes → camelot or docling TableFormer
+- No VLM needed
+
+**hybrid (3 docs, 16% of corpus):**
+- Text sections: GLM-OCR ordered text + docling headings
+- Picture sections: targeted VLM crop (qwen2.5vl:7b) of just the large picture bbox
+- Tables: camelot for grid tables
+
+**poster_mode (6 docs, 31% of corpus):**
+- Full-page VLM extraction (qwen2.5vl:7b with _POSTER_PROMPT)
+- Fallback: GLM-OCR text + `promote_allcaps_headings()` postprocessing
+- Target: 2.9% docling coverage → GLM-OCR gives 87% content recovery
+
+---
+
+## What to implement next
+
+Priority 1 (immediate, 30 min each):
+1. `promote_allcaps_headings()` in postprocess.py — fixes "0 headings" on GLM-OCR fallback
+2. Switch VISION_PRIMARY to qwen2.5vl:7b — already installed, better document training
+
+Priority 2 (1 session):
+3. `_build_from_ground_truth(glm_text, docling_elements)` — combine GLM-OCR content + docling headings
+4. Coverage-based routing in Phase 3 (replace binary poster_mode with 3-tier coverage routing)
+5. Better column detection using docling element X positions (current algorithm fails for AF)
+
+Priority 3 (1-2 sessions):
+6. Targeted picture section extraction using docling `picture` bboxes
+7. camelot for identified grid tables (CHA2DS2-VASc in AF, DRUGS table in stemi)
+8. Fix cardiology_af GLM-OCR (higher resolution or different extraction strategy)

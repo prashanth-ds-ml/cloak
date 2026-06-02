@@ -11,6 +11,20 @@ updated: 2026-06-02 (Session 29)
 
 ---
 
+## Session 30 — end of 2026-06-02
+
+- **All 158 ICMR STW PDFs downloaded** from icmr.gov.in (`scripts/download_icmr_stws.py`). 4 volumes + hypertension, 26 specialties.
+- **4 profiler fixes implemented** (`scripts/profiler.py`):
+  - Fix 1 Hallucination detection: generalized to any WORD+N pattern — now catches nstemi AND neurosurg_spinal (2/3 known cases, vs 1/3 before)
+  - Fix 2 Multi-page: 6 multi-page docs correctly identified (was 0)
+  - Fix 3 OCR correction: qwen3:14b post-pass via `--correct` flag (opt-in, not default due to 250s/doc overhead)
+  - Fix 4 Column detection: content-based STW title filter + 12% threshold. cardiology_af correctly shows 3 columns ✓
+- **Profiler ran on all 158 docs** — 134/158 GLM-OCR success (85%), 27 poster_mode, 23 hybrid, 108 text_mode
+- **Column detection tradeoff**: AF fixed (2→3 ✓) but 5-column docs regressed (5→2). Dense-header docs have no clean gap. Column detection is approximate — does not break extraction, just affects reading order sort quality.
+- **obgyn_antenatal**: hallucination still not caught — its 90 fake sections don't match WORD+N pattern. Needs investigation.
+- **scripts/compare_runs.py**, **scripts/before_after.py**, **scripts/analyze_profiles.py** added.
+- **Tests: 60/60.**
+
 ## Session 29 — end of 2026-06-02
 
 - **Profiler built** (`scripts/profiler.py`) — combines pdfplumber + docling + GLM-OCR into a `DocumentProfile` dataclass. Outputs per-doc `.txt` and `.json` reports. All 19 ICMR STWs profiled.

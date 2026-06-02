@@ -6,7 +6,7 @@ General-purpose. Local-only. No data leaves the machine.
 
 ## Next session — start here
 
-**Sprint 1 · ICMR Standard Treatment Workflows · Session 30**
+**Sprint 1 · ICMR Standard Treatment Workflows · Session 31**
 
 **First task:** run `pytest tests/ -q` — confirm still 60/60.
 
@@ -230,3 +230,4 @@ cloak parse data/raw/cardiology/stemi.pdf
 
 - GPU: RTX 5050 8 GB VRAM | RAM: 24 GB
 - See [[docs/MODELS.md]] §VRAM observations and §Model suitability table
+

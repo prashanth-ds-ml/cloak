@@ -141,26 +141,33 @@ def detect_columns_from_elements(section_headers: list[SectionHeader], page_widt
     if not section_headers:
         return ColumnInfo(count=1, boundaries_pct=[], method="no headers")
 
-    # Fix 4: exclude spanning headers (x < 5%) and right-edge headers (x > 85%)
-    anchored = [h for h in section_headers if 5.0 < h.x_pct < 85.0]
+    # Fix 4: filter spanning/title/footer headers before clustering
+    # - x < 5%: left-margin spanning headers (e.g. STROKE RISK SCORE at x=2.6%)
+    # - x > 85%: right-edge headers
+    # - y < 12%: top title headers (document title, specialty name, ICD code)
+    # - y > 90%: footer headers (REFERENCES, KEEP A HIGH THRESHOLD...)
+    anchored = [h for h in section_headers
+                if 5.0 < h.x_pct < 85.0 and 12.0 < h.y_pct < 90.0]
     if len(anchored) < 2:
         return ColumnInfo(count=1, boundaries_pct=[], method="too few headers")
 
     xs = sorted(h.x_pct for h in anchored)
 
-    # Simple 1D clustering: find gaps > 15% in the sorted X distribution
+    # Find gaps using threshold 12% (lower than old 15% to detect AF's 3 columns)
+    # In ICMR STWs the gap between adjacent columns is typically 12-20%.
+    # 2-column docs have one large gap (>20%), 3-col have two gaps (~12-18%).
     gaps = []
     for i in range(len(xs) - 1):
         gap = xs[i+1] - xs[i]
-        if gap > 15.0:
+        if gap > 12.0:
             boundary = (xs[i] + xs[i+1]) / 2
             gaps.append(round(boundary, 1))
 
     if not gaps:
-        # Try smaller gap threshold
+        # Last resort: smaller threshold
         for i in range(len(xs) - 1):
             gap = xs[i+1] - xs[i]
-            if gap > 10.0:
+            if gap > 8.0:
                 boundary = (xs[i] + xs[i+1]) / 2
                 gaps.append(round(boundary, 1))
 

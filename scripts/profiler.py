@@ -476,7 +476,7 @@ def write_report(prof: DocumentProfile) -> str:
 
 def main():
     target = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/samples/icmr_stw")
-    pdfs = sorted(target.glob("*.pdf")) if target.is_dir() else [target]
+    pdfs = sorted(target.rglob("*.pdf")) if target.is_dir() else [target]
 
     print(f"Profiling {len(pdfs)} PDF(s)  ->  {LOG_DIR}/\n")
 

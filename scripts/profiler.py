@@ -183,9 +183,15 @@ def detect_columns_from_elements(section_headers: list[SectionHeader], page_widt
             boundary = (xs[i] + xs[i+1]) / 2
             gaps.append(round(boundary, 1))
 
-    # No secondary fallback — dense-header documents (24+ headers) produce many
-    # small gaps that create false multi-column detections at lower thresholds.
-    # If no 12% gap is found, declare 1 column (content still extracted correctly).
+    # 10% fallback — NOT 8% (8% creates false boundaries in dense-header docs).
+    # 10% correctly recovers 5-column ortho/paediatrics layouts where column gaps
+    # are 10-13%. The 10% fallback only fires when no 12% gap was found.
+    if not gaps:
+        for i in range(len(xs) - 1):
+            gap = xs[i+1] - xs[i]
+            if gap > 10.0:
+                boundary = (xs[i] + xs[i+1]) / 2
+                gaps.append(round(boundary, 1))
 
     # Deduplicate nearby boundaries (within 5%)
     deduped = []

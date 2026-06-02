@@ -56,7 +56,10 @@ else:
     print("  (none detected)")
 
 # Known hallucinations that should be caught
-KNOWN_HALLUC = ["cardiology_nstemi", "neurosurg_spinal", "obgyn_antenatal"]
+# Note: obgyn_antenatal is NOT a hallucination — it has real age-range table rows
+# (18-24 | MEDICAL NURTURE | DO, etc.) from the antenatal screening schedule.
+# Our detector correctly does NOT flag it.
+KNOWN_HALLUC = ["cardiology_nstemi", "neurosurg_spinal"]
 print("\nKnown hallucination docs - were they caught?")
 for h in KNOWN_HALLUC:
     caught = by_name.get(h, {}).get("glm_hallucination", False)

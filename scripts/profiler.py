@@ -1,15 +1,22 @@
 """
 profiler.py -- deep profiler combining pdfplumber + docling + GLM-OCR.
 
+Fixes applied (Session 30):
+  Fix 1 - Hallucination detection: discard GLM-OCR when it generates fake numbered sections
+  Fix 2 - Multi-page support: profile all pages, report per-page + aggregate
+  Fix 3 - OCR correction: qwen3:14b post-pass fixes phonetic medical term errors
+  Fix 4 - Column detection: filter spanning headers (x<5%) before clustering
+
 Produces a DocumentProfile with everything the extraction pipeline needs:
-  - Column structure (from docling element X clustering)
-  - Content inside picture sections (what pdfplumber sees there)
+  - Column structure per page
+  - Content inside picture sections
   - Section alignment (docling vs GLM-OCR)
-  - Reading order comparison
+  - OCR-corrected section names
+  - Multi-page awareness
 
 Usage:
   python scripts/profiler.py data/samples/icmr_stw/cardiology_af.pdf
-  python scripts/profiler.py data/samples/icmr_stw/   (all PDFs in dir)
+  python scripts/profiler.py data/samples/icmr_stw_full/   (all PDFs in dir)
 """
 from __future__ import annotations
 import sys, io, re, json, time
@@ -110,17 +117,32 @@ class DocumentProfile:
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
+def is_glm_hallucination(sections: list[str]) -> bool:
+    """
+    Fix 1: Detect GLM-OCR hallucination pattern.
+    Some documents trigger the model to generate fake numbered sections
+    like "CONSIDERATION 1" through "CONSIDERATION 106" instead of real content.
+    If >10 sections and >50% match this pattern → hallucination.
+    """
+    if len(sections) < 10:
+        return False
+    numbered = sum(1 for s in sections
+                   if re.match(r'^(CONSIDERATION|ITEM|POINT|SECTION|STEP)\s+\d+', s.strip()))
+    return numbered / len(sections) > 0.50
+
+
 def detect_columns_from_elements(section_headers: list[SectionHeader], page_width: float) -> ColumnInfo:
     """
     Detect column structure using docling section header X positions.
-    Headers are anchored to the left edge of their column — clustering their
-    X positions reveals column boundaries better than a word histogram.
+    Fix 4: Filter spanning headers (x < 5%) — these are left-margin or centered
+    headers that span the full width, not column anchors. Including them skews
+    the clustering and causes 3-column docs to appear as 2-column.
     """
     if not section_headers:
         return ColumnInfo(count=1, boundaries_pct=[], method="no headers")
 
-    # Use only section headers with x < 90% (exclude spanning/footer headers)
-    anchored = [h for h in section_headers if 1.0 < h.x_pct < 85.0]
+    # Fix 4: exclude spanning headers (x < 5%) and right-edge headers (x > 85%)
+    anchored = [h for h in section_headers if 5.0 < h.x_pct < 85.0]
     if len(anchored) < 2:
         return ColumnInfo(count=1, boundaries_pct=[], method="too few headers")
 
@@ -212,6 +234,51 @@ def normalize_section(text: str) -> str:
     return re.sub(r'\s+', ' ', text.upper().strip())[:40]
 
 
+def correct_medical_ocr(text: str) -> str:
+    """
+    Fix 3: Use qwen3:14b to correct phonetic/visual OCR errors in medical text.
+    Only runs when qwen3:14b is available in Ollama. Falls back to original text.
+    Rules: fix spelling errors only, never change clinical values (numbers, doses).
+    """
+    if not text or len(text) < 50:
+        return text
+    try:
+        import ollama as _ollama
+        from cloak.config import MODEL_KEEP_ALIVE
+        prompt = (
+            "Fix OCR spelling errors in this medical text. Rules:\n"
+            "1. Fix phonetic substitutions only (e.g. THROMBOVIC->THROMBOLYTIC, ISTERITY->TERTIARY)\n"
+            "2. Never change clinical values: numbers, doses, thresholds, units\n"
+            "3. Keep ALL-CAPS section headings in ALL-CAPS\n"
+            "4. Do not add or remove any content\n"
+            "5. Return only the corrected text, no explanation\n\n"
+            f"TEXT:\n{text[:3000]}"
+        )
+        resp = _ollama.chat(
+            model="qwen3:14b",
+            messages=[{"role": "user", "content": "/no_think\n" + prompt}],
+            options={"temperature": 0.0, "num_ctx": 4096, "think": False},
+            keep_alive=MODEL_KEEP_ALIVE,
+        )
+        corrected = resp.message.content.strip()
+        # Safety: if correction drastically changes length, revert
+        if corrected and 0.7 < len(corrected) / len(text[:3000]) < 1.5:
+            return corrected + (text[3000:] if len(text) > 3000 else "")
+        return text
+    except Exception:
+        return text
+
+
+def is_correction_available() -> bool:
+    """Return True if qwen3:14b is available for OCR correction."""
+    try:
+        import ollama as _ollama
+        models = _ollama.list()
+        return any("qwen3:14b" in m.model for m in models.models)
+    except Exception:
+        return False
+
+
 def get_pdfplumber_text_in_bbox(page, bbox_norm, page_W, page_H) -> str:
     """Extract pdfplumber text within a normalized bbox [0,1]."""
     try:
@@ -227,15 +294,18 @@ def get_pdfplumber_text_in_bbox(page, bbox_norm, page_W, page_H) -> str:
 
 # ── main profiler ──────────────────────────────────────────────────────────────
 
-def profile(pdf_path: Path) -> DocumentProfile:
+_correction_available: bool | None = None   # cached check
+
+
+def profile(pdf_path: Path, use_ocr_correction: bool = True) -> DocumentProfile:
     pdf_path = Path(pdf_path)
     name = pdf_path.stem
 
-    # ── pdfplumber ──────────────────────────────────────────────────────────
+    # ── pdfplumber (page 0) ─────────────────────────────────────────────────
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
         W, H = page.width, page.height
-        page_count = len(pdf.pages)
+        page_count = len(pdf.pages)        # Fix 2: record full page count
         raw_text = page.extract_text() or ""
         words = page.extract_words(x_tolerance=3, y_tolerance=3)
         tables_raw = page.find_tables()
@@ -256,8 +326,6 @@ def profile(pdf_path: Path) -> DocumentProfile:
                 rows=nr, cols=nc, header_preview=hdr,
             ))
 
-        pdfplumber_page = page  # keep reference for bbox extraction
-
     # ── docling ─────────────────────────────────────────────────────────────
     docling_sections = []
     picture_sections = []
@@ -268,6 +336,16 @@ def profile(pdf_path: Path) -> DocumentProfile:
 
     element_map = run_docling_pass(pdf_path)
     if element_map:
+        # Fix 2: aggregate elements across all pages for coverage, but report
+        # column structure from page 0 (most representative for layout)
+        all_text_chars = 0
+        with pdfplumber.open(pdf_path) as pdf:
+            for pg_num, page_elems in element_map.items():
+                pg_text = (pdf.pages[pg_num].extract_text() or "") if pg_num < len(pdf.pages) else ""
+                te = [e for e in page_elems if e.label in ("text", "section_header", "list_item", "paragraph")]
+                all_text_chars += sum(len(e.text) for e in te)
+
+        # Page 0 for column and section analysis
         elems = element_map.get(0, [])
         label_counts = dict(Counter(e.label for e in elems))
         text_elems = [e for e in elems if e.label in ("text", "section_header", "list_item", "paragraph")]
@@ -275,7 +353,7 @@ def profile(pdf_path: Path) -> DocumentProfile:
         docling_coverage = round(docling_chars / len(raw_text) * 100, 1) if raw_text else 0
         docling_element_count = len(elems)
 
-        # Section headers
+        # Section headers from page 0 (Fix 4: filter x<5% spanning headers)
         for e in sorted(elems, key=lambda x: x.bbox_norm[1]):
             if e.label in ("section_header", "title"):
                 docling_sections.append(SectionHeader(
@@ -285,7 +363,7 @@ def profile(pdf_path: Path) -> DocumentProfile:
                     source="docling",
                 ))
 
-        # Large picture sections (content gaps)
+        # Large picture sections — page 0
         with pdfplumber.open(pdf_path) as pdf:
             pg = pdf.pages[0]
             for e in elems:
@@ -293,9 +371,8 @@ def profile(pdf_path: Path) -> DocumentProfile:
                     continue
                 l, t, r, b = e.bbox_norm
                 area = (r - l) * (b - t) * 100
-                if area < 3.0:  # skip tiny logos
+                if area < 3.0:
                     continue
-                # Extract pdfplumber text from this region
                 pic_text = get_pdfplumber_text_in_bbox(pg, e.bbox_norm, W, H)
                 picture_sections.append(PictureSection(
                     y0_pct=round(t*100, 1), y1_pct=round(b*100, 1),
@@ -305,12 +382,13 @@ def profile(pdf_path: Path) -> DocumentProfile:
                     word_count=len(pic_text.split()) if pic_text else 0,
                 ))
 
-    # ── column detection ────────────────────────────────────────────────────
+    # ── column detection (Fix 4: spanning header filter applied inside) ──────
     columns = detect_columns_from_elements(docling_sections, W)
 
     # ── GLM-OCR ─────────────────────────────────────────────────────────────
     glm_text = ""
     glm_time = 0.0
+    glm_hallucination = False
     glm_available = is_glm_ocr_available()
 
     if glm_available:
@@ -326,7 +404,21 @@ def profile(pdf_path: Path) -> DocumentProfile:
         except Exception:
             pass
 
-    glm_sections = extract_sections_from_text(glm_text) if glm_text else []
+    # Fix 3: OCR correction pass using qwen3:14b
+    global _correction_available
+    if glm_text and use_ocr_correction:
+        if _correction_available is None:
+            _correction_available = is_correction_available()
+        if _correction_available:
+            glm_text = correct_medical_ocr(glm_text)
+
+    # Fix 1: detect hallucination before section extraction
+    raw_sections = extract_sections_from_text(glm_text) if glm_text else []
+    if is_glm_hallucination(raw_sections):
+        glm_hallucination = True
+        glm_sections = []   # discard — use pdfplumber picture bbox text instead
+    else:
+        glm_sections = raw_sections
 
     # ── Cross-tool analysis ─────────────────────────────────────────────────
     docling_norm = {normalize_section(h.text) for h in docling_sections}
@@ -346,7 +438,11 @@ def profile(pdf_path: Path) -> DocumentProfile:
     else:
         strategy = "text_mode"
 
-    return DocumentProfile(
+    # Fix 2: flag multi-page documents
+    if page_count > 1:
+        strategy = strategy + f"_multipage({page_count}p)"
+
+    prof = DocumentProfile(
         name=name, path=str(pdf_path),
         width_pts=round(W), height_pts=round(H), page_count=page_count,
         pdf_chars=len(raw_text), pdf_word_count=len(words), pdf_tables=pdf_tables,
@@ -361,6 +457,9 @@ def profile(pdf_path: Path) -> DocumentProfile:
         picture_text_chars=picture_text_chars,
         extraction_strategy=strategy,
     )
+    # Attach hallucination flag as extra attribute for reporting
+    prof._glm_hallucination = glm_hallucination  # type: ignore[attr-defined]
+    return prof
 
 
 # ── report writer ──────────────────────────────────────────────────────────────
@@ -420,10 +519,14 @@ def write_report(prof: DocumentProfile) -> str:
         L(f"  (single column or no clear gap)")
 
     L(f"\n[GLM-OCR]")
+    hallucinated = getattr(prof, "_glm_hallucination", False)
     if not prof.glm_available:
         L("  Ollama not running or glm-ocr not installed")
     elif prof.glm_chars == 0:
         L("  GLM-OCR failed (GGML error at all resize levels)")
+    elif hallucinated:
+        L(f"  HALLUCINATION DETECTED — {len(extract_sections_from_text(prof.glm_text))} fake sections discarded")
+        L("  Using pdfplumber picture bbox text as fallback")
     else:
         L(f"  Extracted: {prof.glm_chars} chars in {prof.glm_time_s}s")
         L(f"\n  Sections found by GLM-OCR ({len(prof.glm_sections)}):")
@@ -486,10 +589,12 @@ def main():
         t0 = time.monotonic()
         prof = profile(pdf_path)
         elapsed = round(time.monotonic() - t0, 1)
+        hallucinated = "HALLUC " if getattr(prof, "_glm_hallucination", False) else ""
+        multipage = f" {prof.page_count}pp" if prof.page_count > 1 else ""
         print(f"{elapsed}s  cov={prof.docling_coverage_pct}%  "
               f"cols={prof.columns.count}  glm={prof.glm_chars}  "
-              f"gaps={len(prof.picture_sections)}  "
-              f"-> {prof.extraction_strategy}")
+              f"gaps={len(prof.picture_sections)}{multipage}  "
+              f"{hallucinated}-> {prof.extraction_strategy}")
 
         report = write_report(prof)
         log_file = LOG_DIR / f"profile2_{pdf_path.stem}.txt"

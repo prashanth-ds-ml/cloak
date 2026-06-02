@@ -119,16 +119,28 @@ class DocumentProfile:
 
 def is_glm_hallucination(sections: list[str]) -> bool:
     """
-    Fix 1: Detect GLM-OCR hallucination pattern.
-    Some documents trigger the model to generate fake numbered sections
-    like "CONSIDERATION 1" through "CONSIDERATION 106" instead of real content.
-    If >10 sections and >50% match this pattern → hallucination.
+    Fix 1: Detect GLM-OCR hallucination where model generates fake numbered sections.
+    Patterns seen across 158 docs:
+      - "CONSIDERATION 1" through "CONSIDERATION 106" (cardiology_nstemi)
+      - "APPROVED 1." through "APPROVED 106" (neurosurg_spinal)
+      - "SECTION 1" type patterns
+    General rule: if >10 sections and >50% match any WORD + number pattern
+    where the word is the same for most entries → hallucination.
     """
     if len(sections) < 10:
         return False
-    numbered = sum(1 for s in sections
-                   if re.match(r'^(CONSIDERATION|ITEM|POINT|SECTION|STEP)\s+\d+', s.strip()))
-    return numbered / len(sections) > 0.50
+    # Extract leading word from each section
+    words = []
+    for s in sections:
+        m = re.match(r'^([A-Z]+)\s+\d+', s.strip())
+        if m:
+            words.append(m.group(1))
+    if not words:
+        return False
+    from collections import Counter
+    most_common_word, most_common_count = Counter(words).most_common(1)[0]
+    # If one word dominates (>50% of sections are WORD N format) → hallucination
+    return most_common_count / len(sections) > 0.45
 
 
 def detect_columns_from_elements(section_headers: list[SectionHeader], page_width: float) -> ColumnInfo:
@@ -141,21 +153,29 @@ def detect_columns_from_elements(section_headers: list[SectionHeader], page_widt
     if not section_headers:
         return ColumnInfo(count=1, boundaries_pct=[], method="no headers")
 
-    # Fix 4: filter spanning/title/footer headers before clustering
+    # Fix 4: filter non-column headers before clustering
     # - x < 5%: left-margin spanning headers (e.g. STROKE RISK SCORE at x=2.6%)
     # - x > 85%: right-edge headers
-    # - y < 12%: top title headers (document title, specialty name, ICD code)
-    # - y > 90%: footer headers (REFERENCES, KEEP A HIGH THRESHOLD...)
+    # - STW template title: "Standard Treatment Workflow" header appears in ALL ICMR STWs
+    #   as a centered title at the top, NOT anchored to any column. Filter by content.
+    #   Using y-position filter caused regressions on 5-column docs whose real column
+    #   headers happened to be near the top of the page.
+    def _is_stw_title(text: str) -> bool:
+        t = text.lower()
+        return ("standard treatment workflow" in t
+                or re.match(r'^icd-?\d+', t)
+                or re.match(r'^stw\b', t))
+
     anchored = [h for h in section_headers
-                if 5.0 < h.x_pct < 85.0 and 12.0 < h.y_pct < 90.0]
+                if 5.0 < h.x_pct < 85.0 and not _is_stw_title(h.text)]
     if len(anchored) < 2:
         return ColumnInfo(count=1, boundaries_pct=[], method="too few headers")
 
     xs = sorted(h.x_pct for h in anchored)
 
-    # Find gaps using threshold 12% (lower than old 15% to detect AF's 3 columns)
-    # In ICMR STWs the gap between adjacent columns is typically 12-20%.
-    # 2-column docs have one large gap (>20%), 3-col have two gaps (~12-18%).
+    # Gap threshold: 12% detects AF's 3-column gaps (~12.2%) while still
+    # correctly giving 2 columns for stroke (gap = 11.2% < 12% = no boundary there,
+    # but 27% gap → correct 2-column boundary found).
     gaps = []
     for i in range(len(xs) - 1):
         gap = xs[i+1] - xs[i]
@@ -163,13 +183,9 @@ def detect_columns_from_elements(section_headers: list[SectionHeader], page_widt
             boundary = (xs[i] + xs[i+1]) / 2
             gaps.append(round(boundary, 1))
 
-    if not gaps:
-        # Last resort: smaller threshold
-        for i in range(len(xs) - 1):
-            gap = xs[i+1] - xs[i]
-            if gap > 8.0:
-                boundary = (xs[i] + xs[i+1]) / 2
-                gaps.append(round(boundary, 1))
+    # No secondary fallback — dense-header documents (24+ headers) produce many
+    # small gaps that create false multi-column detections at lower thresholds.
+    # If no 12% gap is found, declare 1 column (content still extracted correctly).
 
     # Deduplicate nearby boundaries (within 5%)
     deduped = []
@@ -623,6 +639,7 @@ def main():
             "name": prof.name,
             "coverage": prof.docling_coverage_pct,
             "columns": prof.columns.count,
+            "page_count": prof.page_count,
             "glm_hallucination": getattr(prof, "_glm_hallucination", False),
             "col_boundaries": prof.columns.boundaries_pct,
             "glm_chars": prof.glm_chars,

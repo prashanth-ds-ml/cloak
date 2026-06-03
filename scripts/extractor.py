@@ -1,17 +1,22 @@
 """
 extractor.py -- Landing.ai-style extraction pipeline.
 
+Fixes applied:
+  Fix 1: Single-column HTML tables → plain text with ## headings (not table rows)
+  Fix 2: Camelot table filter — only extract real tables (>=2 rows, >=2 cols)
+  Fix 3: OCR correction via qwen3:14b (--correct flag, off by default for speed)
+
 Flow per document:
   1. Profile   → docling + GLM-OCR + pdfplumber
-  2. Extract   → GLM-OCR text + camelot tables + heading promotion
+  2. Extract   → GLM-OCR HTML→sections + camelot tables (filtered) + OCR correction
   3. Post-proc → clean artifacts, normalize
   4. Judge     → qwen2.5vl:7b evaluates output quality
   5. Compare   → vs Landing.ai JSON where available
 
 Usage:
-  python scripts/extractor.py data/samples/icmr_stw_full/cardiology/cardiology_af.pdf
-  python scripts/extractor.py data/samples/icmr_stw_full/cardiology/cardiology_af.pdf --landing-ai "C:/..."
-  python scripts/extractor.py --batch   (runs all 5 test docs)
+  python scripts/extractor.py <pdf>
+  python scripts/extractor.py --batch            (10 test docs)
+  python scripts/extractor.py --batch --correct  (with OCR correction, slower)
 """
 from __future__ import annotations
 import sys, io, re, json, time, queue, threading
@@ -34,29 +39,41 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 JUDGE_MODEL = "qwen2.5vl:7b"
 
-# ── Test documents — from icmr/ folder with Landing.ai ground truth ──────────
-# Each pair: (PDF path, Landing.ai JSON path)
-# Covers different strategies: hybrid, text_mode, poster_mode
+# ── 10 test documents across all strategies and specialties ──────────────────
 TEST_DOCS = [
-    # Cardiology AF — hybrid (34% docling coverage, complex 3-column layout)
+    # ── Original 5 ──────────────────────────────────────────────────────────
+    # hybrid (complex 3-column, 34% coverage)
     ("icmr/cardiology/Cardiology_STWs/Atrial_Fibrillation.pdf",
      "icmr/Data_Files Cardiology/Atrial_Fibrillation.parse.json"),
-
-    # Neurology Stroke — text_mode (84% coverage, mostly structured text)
+    # text_mode (84% coverage)
     ("icmr/Neurology/Stroke.pdf",
      "icmr/Neurology_Data_Files/Stroke.parse.json"),
-
-    # Paediatrics Dengue — poster_mode (2.9% coverage, full flowchart)
+    # poster_mode (2.9% coverage, full flowchart)
     ("icmr/Paediatrics/Dengue_Fever.pdf",
      "icmr/Paediatrics_Data_Files/Dengue_Fever.parse.json"),
-
-    # Nephrology AKI — text_mode (82% coverage, clean structured doc)
+    # text_mode (82% coverage, clean)
     ("icmr/Nephrology/Acute_Kidney_Injury.pdf",
      "icmr/Nephrology_Data_Files/Acute_Kidney_Injury.parse.json"),
-
-    # ENT Epistaxis — text_mode (different specialty, validate generalisation)
+    # text_mode (ENT specialty)
     ("icmr/ENT/Epistaxis.pdf",
      "icmr/ENT_Data_Files/Epistaxis.parse.json"),
+
+    # ── New 5 ────────────────────────────────────────────────────────────────
+    # poster_mode (STEMI, 29% coverage, drugs table)
+    ("icmr/cardiology/Cardiology_STWs/STEMI.pdf",
+     "icmr/Data_Files Cardiology/STEMI.parse.json"),
+    # poster_mode (Headache, 7.9% coverage)
+    ("icmr/Neurology/Headache.pdf",
+     "icmr/Neurology_Data_Files/Headache.parse.json"),
+    # text_mode (Paediatrics, diarrhea)
+    ("icmr/Paediatrics/Diarrhea.pdf",
+     "icmr/Paediatrics_Data_Files/Diarrhea.parse.json"),
+    # text_mode (OB/GYN specialty)
+    ("icmr/Obstetrics_Gynecology/Heavy_Menstrual_Bleeding.pdf",
+     "icmr/Obstetrics_Gynecology_Data_Files/Heavy_Menstrual_Bleeding.parse.json"),
+    # text_mode (ENT, different condition)
+    ("icmr/ENT/Acute_Rhinosinusitis.pdf",
+     "icmr/ENT_Data_Files/Acute_Rhinosinusitis.parse.json"),
 ]
 
 
@@ -100,26 +117,64 @@ def _html_to_text(html: str) -> str:
     return '\n'.join(lines)
 
 
+def _clean_cell(html: str) -> str:
+    text = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&amp;', '&').replace('&gt;', '>').replace('&lt;', '<')
+    text = text.replace('&nbsp;', ' ').replace('&#39;', "'").replace('&ge;', '≥').replace('&le;', '≤')
+    return text.strip()
+
+
 def _html_table_to_md(table_html: str) -> str:
-    """Convert HTML table to markdown table."""
+    """
+    Fix 1: Convert HTML table to markdown.
+    Single-column tables (GLM-OCR content structure) → plain text with ## headings.
+    Multi-column tables (actual data tables) → proper markdown table.
+    """
     rows = []
     for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE):
         cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', tr, re.DOTALL | re.IGNORECASE)
-        row = []
-        for cell in cells:
-            text = re.sub(r'<br\s*/?>', ' ', cell, flags=re.IGNORECASE)
-            text = re.sub(r'<[^>]+>', '', text)
-            text = text.replace('&amp;', '&').replace('&gt;', '>').replace('&lt;', '<')
-            text = text.replace('&nbsp;', ' ').replace('&#39;', "'")
-            row.append(text.strip())
-        if row:
+        row = [_clean_cell(c) for c in cells]
+        if any(c.strip() for c in row):
             rows.append(row)
 
     if not rows:
         return ""
 
+    # Determine if this is a single-column content structure or a real data table
+    max_cols = max(len(r) for r in rows)
+    non_empty_cols = max(sum(1 for c in r if c.strip()) for r in rows)
+    is_single_col = non_empty_cols <= 1
+
+    if is_single_col:
+        # Fix 1: Single-column → sections with ## headings
+        parts = []
+        for row in rows:
+            text = row[0].strip() if row else ""
+            if not text:
+                continue
+            lines = text.splitlines()
+            first = lines[0].strip() if lines else ""
+            # Promote ALL-CAPS first line to heading
+            if (first and first == first.upper() and len(first) > 3
+                    and not first.isdigit()
+                    and re.search(r'[A-Z]{3,}', first)):
+                parts.append(f"\n## {first}")
+                rest = '\n'.join(lines[1:]).strip()
+                if rest:
+                    parts.append(rest)
+            else:
+                parts.append(text)
+        return '\n\n'.join(p for p in parts if p.strip())
+
+    # Multi-column → proper markdown table
     md_rows = []
     for i, row in enumerate(rows):
+        # Pad short rows to max_cols
+        while len(row) < max_cols:
+            row.append("")
+        # Collapse multiline cells to single line
+        row = [c.replace('\n', ' ') for c in row]
         md_rows.append("| " + " | ".join(row) + " |")
         if i == 0:
             md_rows.append("| " + " | ".join(["---"] * len(row)) + " |")
@@ -161,8 +216,14 @@ def extract_tables_camelot(pdf_path: Path, prof: DocumentProfile) -> dict[tuple,
 
     for t in tables:
         x0, y0, x1, y1 = t.bbox
-        # Skip tiny footer tables
-        if (y1 - y0) < 20 or (x1 - x0) < 100:
+        # Fix 2: Filter out single-column/tiny layout boxes — only real data tables
+        rows = t.extract()
+        if not rows or len(rows) < 2:          # need at least 2 rows
+            continue
+        first_row = [c for c in (rows[0] or []) if c]
+        if len(first_row) < 2:                  # need at least 2 non-empty columns
+            continue
+        if (y1 - y0) < 20 or (x1 - x0) < 100: # skip tiny boxes
             continue
         # camelot uses bottom-left origin
         c_area = f"{x0:.0f},{H-y1:.0f},{x1:.0f},{H-y0:.0f}"
@@ -319,7 +380,7 @@ def compare_landing_ai(our_md: str, la_json_path: Path) -> dict:
 # ── Main extraction function ──────────────────────────────────────────────────
 
 def extract(pdf_path: Path, landing_ai_json: Path | None = None,
-            run_judge: bool = True) -> dict:
+            run_judge: bool = True, use_ocr_correction: bool = False) -> dict:
     """Full extraction pipeline. Returns result dict."""
     pdf_path = Path(pdf_path)
     name = pdf_path.stem
@@ -345,18 +406,28 @@ def extract(pdf_path: Path, landing_ai_json: Path | None = None,
     print("  Step 2: Extracting...", end=" ", flush=True)
     t0 = time.monotonic()
 
-    # 2a. GLM-OCR → HTML → clean markdown
+    # 2a. GLM-OCR → HTML → sections with headings (Fix 1)
     glm_plain = glm_html_to_markdown(prof.glm_text) if prof.glm_text else ""
 
-    # 2b. If GLM-OCR failed or sparse, use pdfplumber text as fallback
+    # 2b. Fallback to pdfplumber if GLM-OCR failed or sparse
     if len(glm_plain.strip()) < 200:
         with pdfplumber.open(pdf_path) as pdf:
             glm_plain = pdf.pages[0].extract_text() or ""
+        glm_plain = promote_headings(glm_plain)
 
-    # 2c. Add heading structure
-    markdown = promote_headings(glm_plain)
+    # 2c. Fix 3: OCR correction via qwen3:14b (only if --correct flag set)
+    if use_ocr_correction and glm_plain:
+        try:
+            from scripts.profiler_v2 import correct_medical_ocr, is_correction_available
+            if is_correction_available():
+                print("\n     OCR correction...", end=" ", flush=True)
+                glm_plain = correct_medical_ocr(glm_plain)
+        except Exception:
+            pass
 
-    # 2d. Extract tables via camelot and inject
+    markdown = glm_plain
+
+    # 2d. Extract real tables via camelot (Fix 2: filtered)
     tables = extract_tables_camelot(pdf_path, prof)
     if tables:
         markdown = inject_tables(markdown, tables, prof)
@@ -442,6 +513,7 @@ def main():
     args = sys.argv[1:]
     no_judge = "--no-judge" in args
     run_batch = "--batch" in args
+    use_correction = "--correct" in args
     args = [a for a in args if not a.startswith("--")]
 
     landing_ai = None
@@ -459,7 +531,8 @@ def main():
                 print(f"  SKIP (not found): {pdf_path.name}")
                 continue
             la_path = Path(la_str) if la_str else None
-            r = extract(pdf_path, la_path, run_judge=not no_judge)
+            r = extract(pdf_path, la_path, run_judge=not no_judge,
+                        use_ocr_correction=use_correction)
             all_results.append(r)
 
         print(f"\n{'='*65}")
@@ -481,7 +554,8 @@ def main():
 
     elif args:
         pdf_path = Path(args[0])
-        extract(pdf_path, landing_ai, run_judge=not no_judge)
+        extract(pdf_path, landing_ai, run_judge=not no_judge,
+                use_ocr_correction=use_correction)
     else:
         print("Usage:")
         print("  python scripts/extractor.py <pdf_path>")

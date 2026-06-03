@@ -1,6 +1,6 @@
 ---
 type: session-log
-updated: 2026-06-02 (Session 29)
+updated: 2026-06-03 (Session 31)
 ---
 
 # Progress — cloak
@@ -10,6 +10,26 @@ updated: 2026-06-02 (Session 29)
 > | [[CLAUDE.md]] · [[ARCHITECTURE.md]] · [[MODULES.md]] · [[MODELS.md]] · [[DECISIONS.md]]
 
 ---
+
+## Session 31 — end of 2026-06-03
+
+**Extraction pipeline built and validated on 10 ICMR STW documents.**
+
+- **Landing.ai comparison**: Got `.parse.json` + `.parse.md` files from user's `icmr/` folder for 10 docs across cardiology, neurology, paediatrics, nephrology, ENT, OB/GYN. This is the ground truth for comparison.
+- **VLM testing**: Tested granite3.2-vision on individual element crops (single-element approach). Found: fast (1-10s) but hallucination risk on text/table sections. Only reliable for isolated, clean flowchart crops at correct resolution.
+- **Table extraction testing**: pdfplumber=94% recall, camelot stream=98% recall, GLM-OCR crop=98% recall — all beat granite3.2-vision (9%). Tables must use PDF-reading tools, never VLMs.
+- **extractor.py built** — Landing.ai-style 4-step pipeline: GLM-OCR text + camelot tables + heading promotion + qwen2.5vl:7b judge + Landing.ai comparison.
+- **3 fixes applied**:
+  - Fix 1: Single-column HTML tables → plain text with ## headings (not table rows)
+  - Fix 2: Camelot table filter — only real data tables (≥2 rows, ≥2 non-empty cols)
+  - Fix 3: OCR correction via qwen3:14b (--correct flag, off by default)
+- **10-doc batch results**: Judge 8-9/10 on 6/10 docs. 4 timeouts (qwen2.5vl:7b batch mode at 120s). Word recall 0.17-0.43 vs Landing.ai (metric skewed by LA HTML tags).
+- **3 new issues found**:
+  - AF partial GLM-OCR (919 chars): pdfplumber fallback threshold (200 chars) too low → need supplement when glm_chars < 40% of pdf_chars
+  - Judge timeouts: increase to 180s + add cold-stall detection
+  - Camelot still over-counting: need stricter area filter (>2% of page area)
+- **camelot-py installed** and working.
+- **Tests: 60/60.**
 
 ## Session 30 — end of 2026-06-02
 

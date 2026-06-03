@@ -6,42 +6,43 @@ General-purpose. Local-only. No data leaves the machine.
 
 ## Next session — start here
 
-**Sprint 1 · ICMR Standard Treatment Workflows · Session 31**
+**Sprint 1 · ICMR Standard Treatment Workflows · Session 32**
 
 **First task:** run `pytest tests/ -q` — confirm still 60/60.
 
-**Profiler is solid. Next focus: improve it further, then use it to drive extraction.**
+**Extraction pipeline exists (`scripts/extractor.py`). Fix 3 issues before re-running.**
 
-**Implement in this order:**
+**Fix 1 — AF partial GLM-OCR (most impactful):**
+`icmr/cardiology/Cardiology_STWs/Atrial_Fibrillation.pdf` only gets 919 GLM-OCR chars but pdfplumber has 5849.
+Pdfplumber fallback threshold is 200 chars — too low. AF passes the threshold but is still missing 85% of content.
+Fix: if `glm_chars < 0.40 * pdf_chars` → supplement with pdfplumber text.
+File: `scripts/extractor.py` → Step 2b fallback logic.
 
-**1. Fix OCR errors — medical correction pass:**
-Add `correct_medical_ocr(text)` function that calls qwen3:14b to fix phonetic/visual substitutions:
-- THROMBOVIC → THROMBOLYTIC, ISTERITY → TERTIARY, SURRAGENOID MEMORAGE → SUBARACHNOID HAEMORRHAGE
-- Prompt: "Fix OCR errors. Keep all clinical values (numbers, doses, thresholds) exact."
-- File: `scripts/profiler.py` → add after `_ocr_page_glm()` call
+**Fix 2 — Camelot over-counting tables:**
+Epistaxis: 38 tables detected (should be 0-1). Diarrhea: 25. Add area filter:
+only extract tables where `(x1-x0) * (y1-y0) > 0.02 * W * H` (>2% of page area).
+File: `scripts/extractor.py` → `extract_tables_camelot()`.
 
-**2. Fix GLM-OCR hallucination detection:**
-cardiology_nstemi generated "CONSIDERATION 1–100" fake sections.
-Add to profiler: if >10 sections AND >50% match `CONSIDERATION \d+` → discard GLM-OCR, use pdfplumber picture bbox text.
+**Fix 3 — Judge timeouts (4/10 docs at 120s):**
+qwen2.5vl:7b enters batch-generation mode for some docs. Increase timeout to 180s
+AND add cold-stall detection (same pattern as vision_tools.py).
+File: `scripts/extractor.py` → `judge_output()`.
 
-**3. Fix cardiology_af 3-column detection:**
-Spanning header STROKE RISK SCORE at x=2.6% skews the column clustering.
-Fix: filter headers with x < 5% before clustering — these are spanning/left-margin headers.
+**After fixes: re-run batch on all 10 docs, compare scores.**
 
-**4. Build GroundTruthMap from DocumentProfile:**
-Create `cloak/profiling/ground_truth.py` with `build_ground_truth_map(pdf_path) -> GroundTruthMap` that the pipeline imports from `profiler.py`.
-Fields: strategy, column_boundaries, ordered_text (GLM-OCR corrected), sections, picture_bboxes, picture_texts.
+**Key extraction results (Session 31):**
+- Judge 8-9/10 on 6/10 docs (4 timeouts need fix)
+- Best: Heavy_Menstrual_Bleeding 9/10, Acute_Rhinosinusitis 9/10
+- Table tools: camelot stream=98% recall, GLM-OCR crop=98% (both beat granite3.2-vision's 9%)
+- OCR correction (--correct flag): works but adds ~250s/doc — use selectively
+- Word recall vs Landing.ai (0.17-0.43): metric is skewed by LA HTML tags — trust judge score instead
 
-**5. Wire DocumentProfile into parser_agent.py Phase 1:**
-Replace current Phase 1b (basic GLM-OCR pass) with full `build_ground_truth_map()`.
-This gives Phase 3 all the routing information it needs.
-
-**Key profiling findings (Session 29) — read `docs/PROFILER_FINDINGS.md`:**
-- GLM-OCR outputs HTML tables (not plain text) — parse with `glm_to_plain_text()`
-- 23 OCR error types catalogued across 19 docs
-- 5 edge cases: hallucination, corrupt PDF, GGML errors, minimal output, partial extraction
-- Column detection: 16/19 correct. neurology_epilepsy: 3 columns correctly detected ✓
-- Picture sections: pdfplumber can extract content from inside picture bboxes
+**Key files:**
+- `scripts/extractor.py` — extraction pipeline
+- `scripts/profiler_v2.py` — 2-pass profiler with VLM + judge
+- `icmr/` — PDFs with Landing.ai `.parse.json` ground truth
+- `data/extraction/` — our extraction outputs
+- `docs/PROFILER_FINDINGS.md` — complete 158-doc profiling analysis
 
 **Tests baseline:** 60/60 passing. Run `pytest tests/ -q` before writing any code.
 
@@ -230,4 +231,5 @@ cloak parse data/raw/cardiology/stemi.pdf
 
 - GPU: RTX 5050 8 GB VRAM | RAM: 24 GB
 - See [[docs/MODELS.md]] §VRAM observations and §Model suitability table
+
 

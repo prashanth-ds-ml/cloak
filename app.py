@@ -38,6 +38,25 @@ st.markdown("""
 
 # ── annotate page image ────────────────────────────────────────────────────────
 
+def _get_table_bboxes(pdf_path_str: str):
+    """Get table bboxes from pdfplumber as normalized (x0,y0,x1,y1,rows,cols) tuples."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path_str) as pdf:
+            page = pdf.pages[0]
+            W, H = page.width, page.height
+            result = []
+            for t in page.find_tables():
+                x0, y0, x1, y1 = t.bbox
+                rows = t.extract()
+                nr = len(rows) if rows else 0
+                nc = len(rows[0]) if rows and rows[0] else 0
+                result.append((x0/W, y0/H, x1/W, y1/H, nr, nc))
+            return result
+    except Exception:
+        return []
+
+
 def build_annotated_image(page_img: Image.Image, prof) -> Image.Image:
     """Draw bboxes and labels on the page image for visual inspection."""
     img = page_img.copy().convert("RGB")
@@ -57,24 +76,19 @@ def build_annotated_image(page_img: Image.Image, prof) -> Image.Image:
         for y in range(0, H, 18):
             draw.line([(x, y), (x, min(y + 10, H))], fill=(255, 220, 0, 200), width=3)
 
-    # ── Docling section headers — blue boxes ──────────────────────────────────
+    # ── Docling section headers — blue dots ───────────────────────────────────
     for h in prof.docling_sections:
-        x_pct = h["x_pct"] / 100
-        y_pct = h["y_pct"] / 100
-        x = int(x_pct * W)
-        y = int(y_pct * H)
-        # Small marker dot for header position
+        x = int(h["x_pct"] / 100 * W)
+        y = int(h["y_pct"] / 100 * H)
         draw.ellipse([x-5, y-5, x+5, y+5], fill=(50, 120, 255, 200))
 
-    # ── pdfplumber tables — green boxes ───────────────────────────────────────
-    for t in prof.pdf_tables:
-        x0 = int(t.x0_pct / 100 * W)
-        y0 = int(t.y0_pct / 100 * H)
-        x1 = int(t.x1_pct / 100 * W)
-        y1 = int(t.y1_pct / 100 * H)
+    # ── pdfplumber tables — green boxes (fetched fresh, pdf_tables is int count)
+    for (x0n, y0n, x1n, y1n, nr, nc) in _get_table_bboxes(prof.path):
+        x0, y0 = int(x0n * W), int(y0n * H)
+        x1, y1 = int(x1n * W), int(y1n * H)
         draw.rectangle([x0, y0, x1, y1], outline=(50, 200, 80, 220), width=3)
         draw.rectangle([x0, y0, x0 + 80, y0 + 18], fill=(50, 200, 80, 180))
-        draw.text((x0 + 3, y0 + 2), f"table {t.rows}r×{t.cols}c", fill="white")
+        draw.text((x0 + 3, y0 + 2), f"table {nr}r×{nc}c", fill="white")
 
     # ── Picture sections (content gaps) — red boxes ───────────────────────────
     for i, p in enumerate(prof.picture_sections):
@@ -146,9 +160,10 @@ def main():
                 t0 = time.monotonic()
                 st.write("🔍 Running docling layout analysis...")
                 prof = pass1_profile(pdf_path)
+                n_elems = sum(prof.docling_label_counts.values()) if prof.docling_label_counts else 0
                 st.write(f"✓ docling: {time.monotonic()-t0:.1f}s  |  "
                          f"coverage={prof.docling_coverage_pct}%  |  "
-                         f"elements={prof.docling_elements}")
+                         f"elements={n_elems}")
 
                 if prof.glm_chars > 0:
                     st.write(f"✓ GLM-OCR: {prof.glm_chars} chars in {prof.glm_time_s}s")
@@ -179,7 +194,7 @@ def main():
         with col_img:
             buf = io.BytesIO()
             annotated.save(buf, format="PNG")
-            st.image(buf.getvalue(), use_column_width=True,
+            st.image(buf.getvalue(), use_container_width=True,
                      caption=f"{uploaded.name} — page 1/{prof.page_count}")
 
         with col_info:
@@ -244,15 +259,16 @@ def main():
             else:
                 st.success("No large content gaps — docling captured everything.")
 
-        with st.expander(f"🟩 Tables ({len(prof.pdf_tables)} found by pdfplumber)", expanded=False):
-            if prof.pdf_tables:
+        with st.expander(f"🟩 Tables ({prof.pdf_tables} found by pdfplumber)", expanded=False):
+            table_bboxes = _get_table_bboxes(prof.path)
+            if table_bboxes:
                 import pandas as pd
                 df = pd.DataFrame([
-                    {"Table": t.index, "Y%": f"{t.y0_pct:.0f}–{t.y1_pct:.0f}",
-                     "X%": f"{t.x0_pct:.0f}–{t.x1_pct:.0f}",
-                     "Size": f"{t.rows}r × {t.cols}c",
-                     "Header preview": t.header_preview[:50]}
-                    for t in prof.pdf_tables
+                    {"#": i+1,
+                     "Y%": f"{y0*100:.0f}–{y1*100:.0f}",
+                     "X%": f"{x0*100:.0f}–{x1*100:.0f}",
+                     "Size": f"{nr}r × {nc}c"}
+                    for i, (x0, y0, x1, y1, nr, nc) in enumerate(table_bboxes)
                 ])
                 st.dataframe(df, use_container_width=True, hide_index=True)
             else:

@@ -276,12 +276,15 @@ def inject_tables(text: str, tables: dict[tuple, str], prof: DocumentProfile) ->
     return text
 
 
-# ── Step 3: Post-processing ───────────────────────────────────────────────────
+# ── Step 3: Post-processing ──────────────────────────────────────────────────
 
-def postprocess(text: str) -> str:
-    """Clean up extraction artifacts."""
-    from cloak.quality import postprocess as pp
-    return pp.run(text)
+def postprocess(text: str, strategy: str = "text_mode") -> str:
+    """Run extraction-specific post-processing then general pipeline cleanup."""
+    from scripts.postprocess_extraction import run as extraction_pp
+    from cloak.quality import postprocess as pipeline_pp
+    text = extraction_pp(text, strategy)
+    text = pipeline_pp.run(text)
+    return text
 
 
 # ── Step 4: Judge output with qwen2.5vl:7b ───────────────────────────────────
@@ -482,7 +485,7 @@ def extract(pdf_path: Path, landing_ai_json: Path | None = None,
     # ── Step 3: Post-process ──────────────────────────────────────────────────
     print("  Step 3: Post-processing...", end=" ", flush=True)
     t0 = time.monotonic()
-    markdown = postprocess(markdown)
+    markdown = postprocess(markdown, strategy=prof.strategy.split("_multi")[0])
     print(f"{time.monotonic()-t0:.1f}s  {len(markdown)} chars final")
 
     # Save output

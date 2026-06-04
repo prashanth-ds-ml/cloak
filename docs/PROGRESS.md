@@ -1,6 +1,6 @@
 ---
 type: session-log
-updated: 2026-06-03 (Session 31)
+updated: 2026-06-04 (Session 32)
 ---
 
 # Progress — cloak
@@ -10,6 +10,18 @@ updated: 2026-06-03 (Session 31)
 > | [[CLAUDE.md]] · [[ARCHITECTURE.md]] · [[MODULES.md]] · [[MODELS.md]] · [[DECISIONS.md]]
 
 ---
+
+## Session 32 — end of 2026-06-04
+
+**3 extractor fixes applied, all 10 docs now judged, baseline established.**
+
+- Fix 1 (GLM supplement): AF recall 0.06→0.66, Stroke 0.21→0.72, AKI 0.19→0.71. When glm_chars < 40% of pdf_chars, append pdfplumber promoted text.
+- Fix 2 (camelot area filter): table_area > 1.5% of page prevents layout box false positives.
+- Fix 3 (judge stall): streaming judge with cold-stall at 90s + mid-stall at 45s. 0 timeouts (was 4/10).
+- **Baseline: 7/10 docs at 9/10, 3/10 at 8/10. Text_mode recall 0.66-0.77. No timeouts.**
+- Remaining gaps: poster_mode recall 0.31-0.38 (format differences vs Landing.ai), `---` separator between GLM and pdfplumber creates duplicate sections, OCR noise (single chars from flowchart arrows), heading hierarchy not always correct.
+- **Next: build proper post-processor to clean these issues.**
+- Tests: 60/60.
 
 ## Session 31 — end of 2026-06-03
 

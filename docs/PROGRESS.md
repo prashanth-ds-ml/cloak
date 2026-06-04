@@ -11,6 +11,31 @@ updated: 2026-06-04 (Session 32)
 
 ---
 
+## Session 32 — end of 2026-06-04 (updated)
+
+**3-run progression complete. Post-processor built and validated.**
+
+Run 1 (original): 6/10 judged (4 timeouts), avg recall 0.25
+Run 2 (+3 fixes): 10/10 judged, avg judge 8.4/10, recall 0.31-0.77
+Run 3 (+post-proc): 10/10 judged, avg judge 8.7/10 — 6×9, 2×8.5, 2×8
+
+Post-processor (scripts/postprocess_extraction.py):
+  - merge_sections(): GLM-OCR + pdfplumber intelligently merged by strategy
+  - clean_ocr_noise(): single-char artifacts, HTML entities, encoding fixes
+  - normalize_headings(): remove ICD codes as headings, deduplicate
+  - clean_tables(): remove empty rows, ensure separator rows
+  - deduplicate_content(): remove repeated paragraphs
+
+Improvements from post-processor: Stroke 8→9, Headache/Diarrhea 8→8.5
+Regression: AF 8.5→8 (merge_sections loses Management Principles for hybrid docs with sparse GLM-OCR)
+
+Remaining issues identified by judge:
+  - Abbreviations/References sometimes missing (trailing content cut)
+  - AF: merge strategy needs fix for very sparse GLM-OCR (919 chars = hybrid but behaves like poster)
+  - STEMI: OCR errors in critical sections
+  - Headache/Diarrhea: some tables not formatted, sections not properly headed
+  - All poster_mode docs: word recall 0.31-0.38 (format differences vs Landing.ai HTML)
+
 ## Session 32 — end of 2026-06-04
 
 **3 extractor fixes applied, all 10 docs now judged, baseline established.**

@@ -216,14 +216,18 @@ def extract_tables_camelot(pdf_path: Path, prof: DocumentProfile) -> dict[tuple,
 
     for t in tables:
         x0, y0, x1, y1 = t.bbox
-        # Fix 2: Filter out single-column/tiny layout boxes — only real data tables
+        # Fix 2: Only extract real data tables — filter layout boxes
         rows = t.extract()
-        if not rows or len(rows) < 2:          # need at least 2 rows
-            continue
+        if not rows or len(rows) < 2:
+            continue                            # need ≥2 rows
         first_row = [c for c in (rows[0] or []) if c]
-        if len(first_row) < 2:                  # need at least 2 non-empty columns
-            continue
-        if (y1 - y0) < 20 or (x1 - x0) < 100: # skip tiny boxes
+        if len(first_row) < 2:
+            continue                            # need ≥2 non-empty columns
+        table_area = (x1 - x0) * (y1 - y0)
+        page_area  = W * H
+        if table_area < 0.015 * page_area:
+            continue                            # skip tiny boxes (<1.5% of page)
+        if (y1 - y0) < 20 or (x1 - x0) < 100:
             continue
         # camelot uses bottom-left origin
         c_area = f"{x0:.0f},{H-y1:.0f},{x1:.0f},{H-y0:.0f}"
@@ -283,12 +287,16 @@ def postprocess(text: str) -> str:
 # ── Step 4: Judge output with qwen2.5vl:7b ───────────────────────────────────
 
 def judge_output(page_img: Image.Image, markdown: str) -> dict:
-    """qwen2.5vl:7b evaluates extraction quality vs the original page image."""
+    """qwen2.5vl:7b evaluates extraction quality vs the original page image.
+    Fix 3: timeout raised to 180s + cold-stall detection at 90s (no tokens).
+    """
     w, h = page_img.size
     if max(w, h) > 768:
         scale = 768 / max(w, h)
         page_img = page_img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
 
+    if page_img.mode != "RGB":
+        page_img = page_img.convert("RGB")
     buf = io.BytesIO()
     page_img.save(buf, format="PNG")
     img_bytes = buf.getvalue()
@@ -302,7 +310,7 @@ Evaluate on these 4 criteria (score each 0-10):
 3. ACCURACY: Are values, numbers, and medical terms correct? No hallucinations?
 4. ORDER: Is content in the correct reading sequence?
 
-Respond in this exact JSON format:
+Respond in this exact JSON format (no other text):
 {{"completeness": N, "structure": N, "accuracy": N, "order": N, "overall": N,
   "missing": ["item1", "item2"],
   "issues": ["issue1", "issue2"],
@@ -311,34 +319,60 @@ Respond in this exact JSON format:
 EXTRACTED MARKDOWN:
 {markdown[:3000]}"""
 
-    result_q: queue.Queue = queue.Queue()
+    # Fix 3: streaming call with cold-stall detection
+    chunks: list[str] = []
+    token_count = [0]
+    last_token_at = [time.monotonic()]
+    error_holder: list[str] = []
+    done_event = threading.Event()
+    COLD_STALL = 90.0   # abort if no tokens in 90s (batch-generation mode)
+    HARD_TIMEOUT = 180.0
+
     def _worker():
         try:
-            resp = ollama.chat(
+            for chunk in ollama.chat(
                 model=JUDGE_MODEL,
                 messages=[{"role": "user", "content": prompt, "images": [img_bytes]}],
                 options={"temperature": 0.0, "num_ctx": 4096},
                 keep_alive=MODEL_KEEP_ALIVE,
-            )
-            result_q.put(("ok", resp.message.content.strip()))
+                stream=True,
+            ):
+                piece = chunk.message.content or ""
+                if piece:
+                    chunks.append(piece)
+                    token_count[0] += 1
+                    last_token_at[0] = time.monotonic()
         except Exception as exc:
-            result_q.put(("err", str(exc)))
+            error_holder.append(str(exc))
+        finally:
+            done_event.set()
 
+    t_start = time.monotonic()
     threading.Thread(target=_worker, daemon=True).start()
-    try:
-        kind, val = result_q.get(timeout=120)
-        if kind == "err":
-            return {"error": val}
-        # Parse JSON from response
-        m = re.search(r'\{.*\}', val, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-        return {"raw": val[:500]}
-    except queue.Empty:
-        return {"error": "judge timeout"}
+
+    while not done_event.wait(timeout=0.5):
+        elapsed = time.monotonic() - t_start
+        since_last = time.monotonic() - last_token_at[0]
+        if elapsed >= HARD_TIMEOUT:
+            return {"error": "judge hard timeout"}
+        # Cold stall: no tokens at all after COLD_STALL seconds
+        if token_count[0] == 0 and elapsed >= COLD_STALL:
+            return {"error": f"judge cold stall ({elapsed:.0f}s, no tokens)"}
+        # Mid-stall: tokens started but stopped for 45s
+        if token_count[0] > 0 and since_last >= 45.0:
+            return {"error": f"judge mid-stall ({since_last:.0f}s silent)"}
+
+    if error_holder:
+        return {"error": error_holder[0]}
+
+    val = "".join(chunks).strip()
+    m = re.search(r'\{.*\}', val, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {"raw": val[:500]}
 
 
 # ── Step 5: Compare vs Landing.ai ────────────────────────────────────────────
@@ -406,14 +440,24 @@ def extract(pdf_path: Path, landing_ai_json: Path | None = None,
     print("  Step 2: Extracting...", end=" ", flush=True)
     t0 = time.monotonic()
 
-    # 2a. GLM-OCR → HTML → sections with headings (Fix 1)
+    # 2a. GLM-OCR → HTML → sections with headings
     glm_plain = glm_html_to_markdown(prof.glm_text) if prof.glm_text else ""
 
-    # 2b. Fallback to pdfplumber if GLM-OCR failed or sparse
-    if len(glm_plain.strip()) < 200:
-        with pdfplumber.open(pdf_path) as pdf:
-            glm_plain = pdf.pages[0].extract_text() or ""
-        glm_plain = promote_headings(glm_plain)
+    # 2b. Supplement/fallback with pdfplumber when GLM-OCR is absent or partial.
+    # Fix 1: threshold was 200 chars — too low. AF has 919 GLM chars but 5849 pdf chars
+    # (GLM only got the scoring table). If GLM < 40% of pdf text → supplement.
+    with pdfplumber.open(pdf_path) as pdf:
+        pdf_full_text = pdf.pages[0].extract_text() or ""
+
+    glm_coverage = len(glm_plain) / max(len(pdf_full_text), 1)
+    if glm_coverage < 0.40 or len(glm_plain.strip()) < 200:
+        # GLM-OCR is partial — supplement with pdfplumber promoted text
+        pdf_promoted = promote_headings(pdf_full_text)
+        if not glm_plain.strip():
+            glm_plain = pdf_promoted      # total fallback
+        else:
+            # Append pdfplumber sections missing from GLM-OCR
+            glm_plain = glm_plain + "\n\n---\n\n" + pdf_promoted
 
     # 2c. Fix 3: OCR correction via qwen3:14b (only if --correct flag set)
     if use_ocr_correction and glm_plain:
